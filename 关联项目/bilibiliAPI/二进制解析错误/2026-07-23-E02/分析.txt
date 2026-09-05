@@ -1,0 +1,1 @@
+读取 [UnknownType-0]-total.bin + 0x0000017B type_为20，这次说明type_20应该是一个byte_string而不是bool。

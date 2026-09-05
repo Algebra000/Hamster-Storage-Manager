@@ -1,0 +1,2 @@
+读取 ...[ParseError]-total.bin+0x00000327 type_值为17，当前代码未对该type做出处理。
+经分析为一 byte_string。

@@ -1,0 +1,97 @@
+# Python environments and generated files
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE and operating-system metadata
+.idea/
+.trae/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs and temporary files
+*.log
+*.pid
+*.tmp
+*.temp
+*.bak
+*~
+
+# Machine-local application configuration
+backend/config/global_config.json
+backend/config/classify_shower_config.json
+backend/config/treemap_config.json
+backend/config/use/
+
+# Runtime databases and playback state
+backend/classify_shower/*.db
+backend/classify_shower/*.db-*
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.deletelist
+**/__RECORD__.json
+**/__HISTORY__.json
+**/dm-info.json
+**/__COMMENT-RECORD__.json
+**/comment.json
+**/comments.json
+**/danmakus.json
+**/dm-srcURL.json
+**/cm-srcURL.json
+**/cmif.json
+**/cm-list.json
+**/resources-URL.json
+**/rmcf.json
+**/__COMMENT__/
+*.bin
+*.har
+
+# Credentials and machine-local tool state
+**/cookie.json
+工具链/弹幕资源批量更新工具/basepath.json
+工具链/弹幕资源批量更新工具/history-basepath/
+工具链/评论下载工具/basepath.json
+
+# Source snapshots are superseded by Git history
+历史版本/
+工具链/old/
+frontend/nplayer/pre/
+关联项目/bilibiliAPI/bilibili_comment_viewer/原初版本/
+
+# Unused local asset alternatives
+frontend/背景图/
+
+# 第三方库
+关联项目/bilibiliAPI/bilibili_api/
+关联项目/bilibiliAPI/更改/文档/
+
+#测试数据
+关联项目/bilibiliAPI/bilibili_comment_viewer/test/
+关联项目/bilibiliAPI/test/
+工具链/b站首页动画背景/res/
+工具链/评论下载工具/test/
+experiments/
+frontend/nplayer/index.html
+工具链/评论下载工具/番剧剧集页面初始数据分析/
+工具链/b站首页动画背景/test/
+关联项目/评论json转db/AI生成原始版本/test/
+关联项目/评论json转db/std/test/
+关联项目/评论json转db/v1/test/
+
+#发行版本
+build/release/
+
+#项目外部文件
+show_tree.bat

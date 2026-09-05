@@ -1,0 +1,543 @@
+/**
+* 分类展示模块，适用于 ROLAND 版本的仓鼠存储管理器。
+* 用于分类展示库里的8种资源
+*/
+
+// 模块使用的区域索引
+const CLASSIFY_SHOWER_JS_MODULE_INDEX = 0;
+
+// SVG图标字符串
+
+//大类图标
+const cs_video_svg_string = `<path opacity="0.5" fill-rule="evenodd" clip-rule="evenodd" d="M3.46447 3.46447C2 4.92893 2 7.28595 2 12C2 16.714 2 19.0711 3.46447 20.5355C4.92893 22 7.28595 22 12 22C16.714 22 19.0711 22 20.5355 20.5355C22 19.0711 22 16.714 22 12C22 7.28595 22 4.92893 20.5355 3.46447C19.0711 2 16.714 2 12 2C7.28595 2 4.92893 2 3.46447 3.46447Z" fill="#1C274C"/>
+<path d="M14 12C14 11.4722 13.4704 11.1162 12.4112 10.4043C11.3375 9.68271 10.8006 9.3219 10.4003 9.58682C10 9.85174 10 10.5678 10 12C10 13.4322 10 14.1483 10.4003 14.4132C10.8006 14.6781 11.3375 14.3173 12.4112 13.5957C13.4704 12.8838 14 12.5278 14 12Z" fill="#1C274C"/>
+<path d="M11.25 2C9.88386 2.00133 8.73121 2.01015 7.75004 2.0685V6.24976H11.25V2Z" fill="#1C274C"/>
+<path d="M6.25004 2.2214C5.02731 2.41566 4.14854 2.78019 3.46451 3.46423C2.78047 4.14826 2.41594 5.02703 2.22168 6.24976H6.25004V2.2214Z" fill="#1C274C"/>
+<path d="M21.7784 6.24976C21.5841 5.02703 21.2196 4.14826 20.5356 3.46423C19.8515 2.78019 18.9728 2.41566 17.75 2.2214V6.24976H21.7784Z" fill="#1C274C"/>
+<path d="M12.75 2C14.1162 2.00133 15.2689 2.01015 16.25 2.0685V6.24976H12.75V2Z" fill="#1C274C"/>
+<path d="M21.7784 17.7498H17.75V21.7781C18.9728 21.5839 19.8515 21.2193 20.5356 20.5353C21.2196 19.8513 21.5841 18.9725 21.7784 17.7498Z" fill="#1C274C"/>
+<path d="M16.25 17.7498V21.931C15.2689 21.9894 14.1162 21.9982 12.75 21.9995V17.7498H16.25Z" fill="#1C274C"/>
+<path d="M11.25 21.9995V17.7498H7.75004L7.75004 21.931C8.73121 21.9894 9.88386 21.9982 11.25 21.9995Z" fill="#1C274C"/>
+<path d="M6.25004 17.7498L6.25004 21.7781C5.02731 21.5839 4.14854 21.2193 3.46451 20.5353C2.78047 19.8513 2.41594 18.9725 2.22168 17.7498H6.25004Z" fill="#1C274C"/>
+`;
+const cs_image_svg_string = `<path opacity="0.5" fill-rule="evenodd" clip-rule="evenodd" d="M3.46447 3.46447C2 4.92893 2 7.28595 2 12C2 16.714 2 19.0711 3.46447 20.5355C4.92893 22 7.28595 22 12 22C16.714 22 19.0711 22 20.5355 20.5355C22 19.0711 22 16.714 22 12C22 7.28595 22 4.92893 20.5355 3.46447C19.0711 2 16.714 2 12 2C7.28595 2 4.92893 2 3.46447 3.46447Z" fill="#1C274C"/>
+<path d="M8.50397 13.1766C7.91991 12.5566 6.94501 12.5241 6.32092 13.1038L5.51041 13.8566C5.20691 14.1385 4.73236 14.1209 4.45047 13.8174C4.16858 13.5139 4.1861 13.0394 4.4896 12.7575L5.3001 12.0047C6.52816 10.8641 8.44651 10.9281 9.59579 12.1481L12.2433 14.9584C12.5202 15.2523 12.9735 15.2919 13.2972 15.0504C14.4971 14.1553 16.1679 14.257 17.2503 15.2911L19.5181 17.4577C19.8176 17.7438 19.8284 18.2186 19.5423 18.5181C19.2562 18.8176 18.7814 18.8284 18.4819 18.5423L16.2141 16.3757C15.661 15.8473 14.8073 15.7953 14.1941 16.2527C13.2596 16.9499 11.9509 16.8356 11.1515 15.9869L8.50397 13.1766Z" fill="#1C274C"/>
+<path d="M18 8C18 9.10457 17.1046 10 16 10C14.8954 10 14 9.10457 14 8C14 6.89543 14.8954 6 16 6C17.1046 6 18 6.89543 18 8Z" fill="#1C274C"/>`;
+
+const cs_audio_svg_string = `<path d="M12.0534 2C14.2007 1.99999 15.8835 1.99998 17.1965 2.1787C18.5405 2.36163 19.6009 2.74337 20.4333 3.58607C21.2657 4.42878 21.6428 5.50242 21.8234 6.86303C22 8.19233 22 9.89603 21.9999 12.07L22 17.3675C22.0003 18.1844 22.0005 18.7446 21.8569 19.2364C21.5761 20.1982 20.9046 20.9937 20.01 21.4245C19.5526 21.6449 19.006 21.732 18.2089 21.8591L18.0789 21.8799C17.7955 21.9252 17.5532 21.9639 17.3523 21.9839C17.1432 22.0047 16.9299 22.0111 16.7118 21.9676C15.9942 21.8245 15.4024 21.3126 15.1509 20.6172C15.0744 20.4059 15.0474 20.1916 15.0351 19.9793C15.0232 19.7753 15.0232 19.527 15.0232 19.2365L15.0232 15.0641C15.0226 14.6386 15.0222 14.2725 15.1196 13.959C15.3423 13.2416 15.9238 12.6975 16.6477 12.5292C16.9641 12.4556 17.3246 12.4849 17.7435 12.5189L17.8368 12.5264L17.9466 12.5352C18.7303 12.5975 19.2665 12.6402 19.7217 12.8106C20.0415 12.9304 20.3382 13.0953 20.6046 13.2976V12.124C20.6046 9.8843 20.6031 8.27554 20.4405 7.05126C20.2807 5.8473 19.9766 5.12146 19.4467 4.58497C18.9167 4.04848 18.1998 3.74063 17.0106 3.57876C15.8013 3.41416 14.2123 3.41266 12 3.41266C9.78771 3.41266 8.19868 3.41416 6.9894 3.57876C5.80019 3.74063 5.08325 4.04848 4.55334 4.58497C4.02343 5.12146 3.71934 5.8473 3.55946 7.05126C3.39688 8.27554 3.39539 9.8843 3.39539 12.124V13.2976C3.66181 13.0953 3.95848 12.9304 4.27834 12.8106C4.73351 12.6402 5.2697 12.5975 6.05341 12.5352L6.16324 12.5264L6.25647 12.5189C6.6754 12.4849 7.03586 12.4556 7.35229 12.5292C8.07617 12.6975 8.65772 13.2416 8.88044 13.959C8.9778 14.2725 8.97735 14.6386 8.97684 15.0641L8.97676 19.2365C8.97677 19.527 8.97677 19.7753 8.96492 19.9793C8.95259 20.1916 8.92556 20.4059 8.84911 20.6172C8.59759 21.3126 8.0058 21.8245 7.28817 21.9676C7.07006 22.0111 6.8568 22.0047 6.64773 21.9839C6.44676 21.9639 6.20454 21.9252 5.92107 21.8799L5.79111 21.8591C4.99404 21.732 4.44742 21.6449 3.98996 21.4245C3.09539 20.9937 2.42393 20.1982 2.14313 19.2364C1.99954 18.7446 1.99973 18.1844 2.00003 17.3675L2.00005 12.07C2.00004 9.89602 2.00003 8.19233 2.17656 6.86303C2.35725 5.50242 2.73431 4.42878 3.56668 3.58607C4.39906 2.74337 5.45954 2.36163 6.80347 2.1787C8.11648 1.99998 9.79929 1.99999 11.9466 2H12.0534Z" fill="#1C274C"/>
+<g opacity="0.5">
+<path fill-rule="evenodd" clip-rule="evenodd" d="M12 5.75C12.4142 5.75 12.75 6.08579 12.75 6.5V11.5C12.75 11.9142 12.4142 12.25 12 12.25C11.5858 12.25 11.25 11.9142 11.25 11.5V6.5C11.25 6.08579 11.5858 5.75 12 5.75Z" fill="#1C274C"/>
+<path fill-rule="evenodd" clip-rule="evenodd" d="M15 7.25C15.4142 7.25 15.75 7.58579 15.75 8L15.75 10C15.75 10.4142 15.4142 10.75 15 10.75C14.5858 10.75 14.25 10.4142 14.25 10L14.25 8C14.25 7.58579 14.5858 7.25 15 7.25Z" fill="#1C274C"/>
+<path fill-rule="evenodd" clip-rule="evenodd" d="M9 7.25C9.41421 7.25 9.75 7.58579 9.75 8V10C9.75 10.4142 9.41421 10.75 9 10.75C8.58579 10.75 8.25 10.4142 8.25 10V8C8.25 7.58579 8.58579 7.25 9 7.25Z" fill="#1C274C"/>
+</g>
+`;
+const cs_project_svg_string = `<path fill-rule="evenodd" clip-rule="evenodd" d="M10.5812 2.25L10.5608 2.25C10.4473 2.24998 10.359 2.24997 10.2754 2.25503C9.21495 2.31926 8.28636 2.98855 7.89009 3.97426C7.85868 4.05239 7.80699 4.20756 7.77012 4.31825L7.76624 4.32989C7.66314 4.60981 7.47697 4.85224 7.26145 5.02534C7.03397 5.0327 6.81671 5.0422 6.60903 5.05445C4.96507 5.15144 3.92181 5.42122 3.17145 6.17158C2.92679 6.41624 2.73322 6.69204 2.58008 7.00965C2.63765 7.0293 2.69375 7.05632 2.74709 7.09099C4.84738 8.45617 6.16697 9.31008 7.26344 9.85786C7.32989 9.51166 7.63439 9.25009 7.99997 9.25009C8.41418 9.25009 8.74997 9.58588 8.74997 10.0001V10.458C10.8694 11.0976 13.1305 11.0976 15.25 10.458V10.0001C15.25 9.58588 15.5858 9.25009 16 9.25009C16.3656 9.25009 16.6701 9.5117 16.7365 9.85794C17.833 9.31015 19.1526 8.45623 21.253 7.09099C21.3063 7.05638 21.3623 7.02939 21.4197 7.00975C21.2666 6.6921 21.073 6.41626 20.8283 6.17158C20.078 5.42122 19.0347 5.15144 17.3907 5.05445C17.1936 5.04282 16.9878 5.03367 16.7728 5.02648C16.7593 5.01545 16.7457 5.00406 16.7321 4.99231C16.4914 4.78435 16.3032 4.51011 16.2083 4.25288L16.2052 4.24344C16.1693 4.13576 16.1414 4.05195 16.1101 3.97426C15.7139 2.98855 14.7853 2.31926 13.7248 2.25503C13.6412 2.24997 13.5529 2.24998 13.4394 2.25L10.5812 2.25ZM14.8175 4.81569L14.813 4.80495L14.8081 4.79286L14.8035 4.78091L14.7999 4.77097L14.7981 4.76596L14.7939 4.75373L14.7901 4.74244L14.788 4.73617L14.7852 4.72783L14.783 4.72079L14.7812 4.7151C14.7418 4.59708 14.7297 4.56204 14.7184 4.53375C14.5383 4.08571 14.1162 3.78148 13.6342 3.75229C13.6019 3.75034 13.5623 3.75 13.419 3.75H10.5812C10.4379 3.75 10.3983 3.75034 10.3661 3.75229C9.88412 3.78148 9.46209 4.08561 9.28192 4.53354L9.27928 4.54052L9.27132 4.56245C9.26468 4.58104 9.2566 4.60429 9.24728 4.63156C9.23076 4.67994 9.2122 4.73546 9.19339 4.79186L9.19157 4.79777L9.18933 4.80481L9.1866 4.81314L9.1845 4.81941L9.18067 4.83071L9.17643 4.84295L9.17465 4.84796L9.17102 4.85791L9.16644 4.86987L9.16156 4.88199L9.15739 4.8919L9.15674 4.89336C9.14281 4.92921 9.12806 4.96498 9.11251 5.00064C9.39614 5 9.69171 5 9.99988 5H13.9999C14.3114 5 14.61 5 14.8964 5.00066C14.8679 4.93956 14.8416 4.87784 14.8175 4.81569Z" fill="#1C274D"/>
+<path opacity="0.5" d="M2.16208 8.49951C2 9.60329 2 11.0494 2 12.9998C2 16.7711 2 18.6567 3.17157 19.8283C4.34315 20.9998 6.22876 20.9998 10 20.9998H14C17.7712 20.9998 19.6569 20.9998 20.8284 19.8283C22 18.6567 22 16.7711 22 12.9998C22 11.0495 22 9.60346 21.8379 8.49971C19.5613 9.97954 18.1021 10.9233 16.7501 11.5045V11.9999C16.7501 12.4141 16.4143 12.7499 16.0001 12.7499C15.5914 12.7499 15.259 12.423 15.2503 12.0163C13.12 12.5779 10.8802 12.5779 8.74991 12.0163C8.74121 12.4229 8.40883 12.7499 8.00009 12.7499C7.58587 12.7499 7.25009 12.4141 7.25009 11.9999V11.5044C5.89804 10.9232 4.43881 9.9794 2.16208 8.49951Z" fill="#1C274D"/>`;
+
+const cs_book_svg_string = `<path opacity="0.5" d="M4.72718 2.73332C5.03258 2.42535 5.46135 2.22456 6.27103 2.11478C7.10452 2.00177 8.2092 2 9.7931 2H14.2069C15.7908 2 16.8955 2.00177 17.729 2.11478C18.5387 2.22456 18.9674 2.42535 19.2728 2.73332C19.5782 3.0413 19.7773 3.47368 19.8862 4.2902C19.9982 5.13073 20 6.24474 20 7.84202L20 18H7.42598C6.34236 18 5.96352 18.0057 5.67321 18.0681C5.15982 18.1785 4.71351 18.4151 4.38811 18.7347C4.27837 18.8425 4.22351 18.8964 4.09696 19.2397C4.02435 19.4367 4 19.5687 4 19.7003V7.84202C4 6.24474 4.00176 5.13073 4.11382 4.2902C4.22268 3.47368 4.42179 3.0413 4.72718 2.73332Z" fill="#1C274D"/>
+<path d="M20 18H7.42598C6.34236 18 5.96352 18.0057 5.67321 18.0681C5.15982 18.1785 4.71351 18.4151 4.38811 18.7347C4.27837 18.8425 4.22351 18.8964 4.09696 19.2397C3.97041 19.5831 3.99045 19.7288 4.03053 20.02C4.03761 20.0714 4.04522 20.1216 4.05343 20.1706C4.16271 20.8228 4.36259 21.1682 4.66916 21.4142C4.97573 21.6602 5.40616 21.8206 6.21896 21.9083C7.05566 21.9986 8.1646 22 9.75461 22H14.1854C15.7754 22 16.8844 21.9986 17.7211 21.9083C18.5339 21.8206 18.9643 21.6602 19.2709 21.4142C19.4705 21.254 19.6249 21.0517 19.7385 20.75H8C7.58579 20.75 7.25 20.4142 7.25 20C7.25 19.5858 7.58579 19.25 8 19.25H19.9754C19.9926 18.8868 19.9982 18.4741 20 18Z" fill="#1C274D"/>
+<path d="M7.25 7C7.25 6.58579 7.58579 6.25 8 6.25H16C16.4142 6.25 16.75 6.58579 16.75 7C16.75 7.41421 16.4142 7.75 16 7.75H8C7.58579 7.75 7.25 7.41421 7.25 7Z" fill="#1C274D"/>
+<path d="M8 9.75C7.58579 9.75 7.25 10.0858 7.25 10.5C7.25 10.9142 7.58579 11.25 8 11.25H13C13.4142 11.25 13.75 10.9142 13.75 10.5C13.75 10.0858 13.4142 9.75 13 9.75H8Z" fill="#1C274D"/>`;
+
+const cs_web_svg_string = `
+<path opacity="0.5" fill-rule="evenodd" clip-rule="evenodd" d="M10 22H14C17.7712 22 19.6569 22 20.8284 20.8284C22 19.6569 22 17.7712 22 14V13.5629C22 12.6901 22 12.0344 21.9574 11.5001H18L17.9051 11.5001C16.808 11.5002 15.8385 11.5003 15.0569 11.3952C14.2098 11.2813 13.3628 11.0198 12.6716 10.3285C11.9803 9.63726 11.7188 8.79028 11.6049 7.94316C11.4998 7.16164 11.4999 6.19207 11.5 5.09497L11.5092 2.26057C11.5095 2.17813 11.5166 2.09659 11.53 2.01666C11.1214 2 10.6358 2 10.0298 2C6.23869 2 4.34315 2 3.17157 3.17157C2 4.34315 2 6.22876 2 10V14C2 17.7712 2 19.6569 3.17157 20.8284C4.34315 22 6.22876 22 10 22Z" fill="#1C274C"/>
+<path d="M10.7022 14.2635C10.8477 13.8757 10.6512 13.4434 10.2633 13.298C9.8755 13.1525 9.44319 13.349 9.29775 13.7369L7.79775 17.7369C7.65231 18.1247 7.84882 18.557 8.23666 18.7024C8.6245 18.8479 9.05681 18.6514 9.20225 18.2635L10.7022 14.2635Z" fill="#1C274C"/>
+<path d="M7.53033 14.5305C7.82322 14.2376 7.82322 13.7628 7.53033 13.4699C7.23744 13.177 6.76256 13.177 6.46967 13.4699L5.46967 14.4699C5.17678 14.7628 5.17678 15.2376 5.46967 15.5305L6.46967 16.5305C6.76256 16.8234 7.23744 16.8234 7.53033 16.5305C7.82322 16.2376 7.82322 15.7628 7.53033 15.4699L7.06066 15.0002L7.53033 14.5305Z" fill="#1C274C"/>
+<path d="M12.0303 15.4699C11.7374 15.177 11.2626 15.177 10.9697 15.4699C10.6768 15.7628 10.6768 16.2376 10.9697 16.5305L11.4393 17.0002L10.9697 17.4699C10.6768 17.7628 10.6768 18.2376 10.9697 18.5305C11.2626 18.8234 11.7374 18.8234 12.0303 18.5305L13.0303 17.5305C13.3232 17.2376 13.3232 16.7628 13.0303 16.4699L12.0303 15.4699Z" fill="#1C274C"/>
+<path d="M11.5092 2.2601L11.5 5.0945C11.4999 6.1916 11.4998 7.16117 11.6049 7.94269C11.7188 8.78981 11.9803 9.6368 12.6716 10.3281C13.3629 11.0193 14.2098 11.2808 15.057 11.3947C15.8385 11.4998 16.808 11.4997 17.9051 11.4996L21.9574 11.4996C21.9698 11.6552 21.9786 11.821 21.9848 11.9995H22C22 11.732 22 11.5983 21.9901 11.4408C21.9335 10.5463 21.5617 9.52125 21.0315 8.79853C20.9382 8.6713 20.8743 8.59493 20.7467 8.44218C19.9542 7.49359 18.911 6.31193 18 5.49953C17.1892 4.77645 16.0787 3.98536 15.1101 3.3385C14.2781 2.78275 13.862 2.50487 13.2915 2.29834C13.1403 2.24359 12.9408 2.18311 12.7846 2.14466C12.4006 2.05013 12.0268 2.01725 11.5 2.00586L11.5092 2.2601Z" fill="#1C274C"/>
+`;
+
+const cs_game_svg_string = `<path opacity="0.5" d="M10.6669 6.13443L10.165 5.77922C9.44862 5.27225 8.59264 5 7.71504 5H7.10257C6.69838 5 6.29009 5.02549 5.90915 5.16059C3.52645 6.00566 1.88749 9.09504 2.00604 16.1026C2.02992 17.5145 2.3603 19.075 3.63423 19.6842C4.03121 19.8741 4.49667 20 5.02671 20C5.66273 20 6.1678 19.8187 6.55763 19.5632C6.96641 19.2953 7.32633 18.9471 7.68612 18.599L7.68612 18.599C8.13071 18.1688 8.57511 17.7389 9.11125 17.4609C9.69519 17.1581 10.3434 17 11.0011 17H12.9989C13.6566 17 14.3048 17.1581 14.8888 17.4609C15.4249 17.7389 15.8693 18.1688 16.3139 18.599L16.3139 18.599C16.6737 18.9471 17.0336 19.2953 17.4424 19.5632C17.8322 19.8187 18.3373 20 18.9733 20C19.5033 20 19.9688 19.8741 20.3658 19.6842C21.6397 19.075 21.9701 17.5145 21.994 16.1026C22.1125 9.09503 20.4735 6.00566 18.0908 5.16059C17.7099 5.02549 17.3016 5 16.8974 5H16.2849C15.4074 5 14.5514 5.27225 13.8351 5.77922L13.3332 6.13441C12.9434 6.41029 12.4776 6.55844 12 6.55844C11.5225 6.55844 11.0567 6.41029 10.6669 6.13443Z" fill="#1C274C"/>
+<path d="M16.75 9C17.1642 9 17.5 9.33579 17.5 9.75C17.5 10.1642 17.1642 10.5 16.75 10.5C16.3358 10.5 16 10.1642 16 9.75C16 9.33579 16.3358 9 16.75 9Z" fill="#1C274C"/>
+<path d="M7.5 9.25C7.91421 9.25 8.25 9.58579 8.25 10V10.75H9C9.41421 10.75 9.75 11.0858 9.75 11.5C9.75 11.9142 9.41421 12.25 9 12.25H8.25V13C8.25 13.4142 7.91421 13.75 7.5 13.75C7.08579 13.75 6.75 13.4142 6.75 13V12.25H6C5.58579 12.25 5.25 11.9142 5.25 11.5C5.25 11.0858 5.58579 10.75 6 10.75H6.75V10C6.75 9.58579 7.08579 9.25 7.5 9.25Z" fill="#1C274C"/>
+<path d="M19 11.25C19 11.6642 18.6642 12 18.25 12C17.8358 12 17.5 11.6642 17.5 11.25C17.5 10.8358 17.8358 10.5 18.25 10.5C18.6642 10.5 19 10.8358 19 11.25Z" fill="#1C274C"/>
+<path d="M15.25 12C15.6642 12 16 11.6642 16 11.25C16 10.8358 15.6642 10.5 15.25 10.5C14.8358 10.5 14.5 10.8358 14.5 11.25C14.5 11.6642 14.8358 12 15.25 12Z" fill="#1C274C"/>
+<path d="M17.5 12.75C17.5 12.3358 17.1642 12 16.75 12C16.3358 12 16 12.3358 16 12.75C16 13.1642 16.3358 13.5 16.75 13.5C17.1642 13.5 17.5 13.1642 17.5 12.75Z" fill="#1C274C"/>`;
+
+const cs_other_svg_string = `<path opacity="0.5" d="M3.46447 20.5355C4.92893 22 7.28595 22 12 22C16.714 22 19.0711 22 20.5355 20.5355C22 19.0711 22 16.714 22 12C22 7.28595 22 4.92893 20.5355 3.46447C19.0711 2 16.714 2 12 2C7.28595 2 4.92893 2 3.46447 3.46447C2 4.92893 2 7.28595 2 12C2 16.714 2 19.0711 3.46447 20.5355Z" fill="#1C274C"/>
+<path d="M8 13C8.55228 13 9 12.5523 9 12C9 11.4477 8.55228 11 8 11C7.44772 11 7 11.4477 7 12C7 12.5523 7.44772 13 8 13Z" fill="#1C274C"/>
+<path d="M12 13C12.5523 13 13 12.5523 13 12C13 11.4477 12.5523 11 12 11C11.4477 11 11 11.4477 11 12C11 12.5523 11.4477 13 12 13Z" fill="#1C274C"/>
+<path d="M16 13C16.5523 13 17 12.5523 17 12C17 11.4477 16.5523 11 16 11C15.4477 11 15 11.4477 15 12C15 12.5523 15.4477 13 16 13Z" fill="#1C274C"/>`;
+
+const cs_mainicon_viewbox = '0 0 24 24';
+
+//返回按钮图标
+const cs_return_svg_string = `<path d="M15.036 9.577a1.03 1.03 0 0 1-1.03 1.03H4.479l2.76 2.759a1.03 1.03 0 0 1-1.456 1.455l-4.516-4.516a1.029 1.029 0 0 1 0-1.455l4.516-4.516a1.03 1.03 0 1 1 1.455 1.455l-2.76 2.76h9.53a1.03 1.03 0 0 1 1.029 1.028z"/>`;
+const cs_returnicon_viewbox = '-1.5 0 19 19';
+const cs_home_svg_string = `<path d="M14.993 7.61a.554.554 0 0 1-.756.207L7.98 4.255 1.764 7.817a.554.554 0 0 1-.55-.962l1.192-.683v-2.48a.476.476 0 0 1 .475-.474h1.222a.476.476 0 0 1 .475.475v1.234l3.126-1.79a.554.554 0 0 1 .55-.001l6.531 3.718a.554.554 0 0 1 .208.756zm-1.399.937v6.198a.476.476 0 0 1-.475.475H2.881a.476.476 0 0 1-.475-.475v-6.2L7.98 5.353zm-6.782 1.01H4.578v2.262h2.234zm4.61 0H9.188v2.262h2.234z"/>`;
+const cs_homeicon_viewbox = '-1.5 0 19 19';
+ 
+// 分类数据
+const cs_CLASSIFICATIONS = [
+    {
+        name: '视频',
+        icon: cs_video_svg_string,
+        description: '相册、番剧、电影等'
+    },
+    {
+        name: '图片',
+        icon: cs_image_svg_string,
+        description: '照片、漫画、画作等'
+    },
+    {
+        name: '音频',
+        icon: cs_audio_svg_string,
+        description: '录音、音乐等'
+    },
+    {
+        name: '项目',
+        icon: cs_project_svg_string,
+        description: '程序项目、作业项目等'
+    },
+    {
+        name: '电子书 & 文献',
+        icon: cs_book_svg_string,
+        description: '小说、教材、论文等'
+    },
+    {
+        name: '网页 & 笔记',
+        icon: cs_web_svg_string,
+        description: '网页杂物、笔记等'
+    },
+    {
+        name: '软件 & 游戏',
+        icon: cs_game_svg_string,
+        description: '系统镜像、软件、galgame等'
+    },
+    {
+        name: '其他',
+        icon: cs_other_svg_string,
+        description: '聊天记录、特殊意义文件等'
+    }
+];
+
+/**
+* 初始化分类展示模块
+*/
+function classifyShowerInit() {
+    console.log('分类展示模块：初始化');
+    
+    // 获取分配的区域
+    const block = get_block(CLASSIFY_SHOWER_JS_MODULE_INDEX);
+    if (!block) {
+        console.error('分类展示模块：无法获取分配的区域');
+        return;
+    }
+    
+    // 清空区域内容
+    block.innerHTML = '';
+    
+    // 设置区域样式
+    block.style.display = 'flex';
+    block.style.flexDirection = 'row';
+    block.style.justifyContent = 'space-around';
+    block.style.alignItems = 'center';
+    block.style.padding = '20px';
+    
+    // 添加CSS样式
+    const style = document.createElement('style');
+    style.textContent = `
+        .cs-classification-item:hover {
+            background-color: rgba(0,0,0,0.05);
+            transform: translateY(-2px);
+        }
+    `;
+    document.head.appendChild(style);
+    
+    // 创建分类项
+    cs_CLASSIFICATIONS.forEach((classification, index) => {
+        const item = document.createElement('div');
+        item.className = 'cs-classification-item';
+        item.style.display = 'flex';
+        item.style.flexDirection = 'column';
+        item.style.alignItems = 'center';
+        item.style.justifyContent = 'center';
+        item.style.width = 'calc(12.5% - 10px)'; // 8份，减去间距
+        item.style.height = '100%';
+        item.style.padding = '10px';
+        item.style.boxSizing = 'border-box';
+        item.style.cursor = 'pointer';
+        item.style.transition = 'all 0.3s ease';
+        item.style.borderRadius = '8px';
+        
+        // 创建图标容器
+        const iconContainer = document.createElement('div');
+        iconContainer.className = 'cs-classification-icon';
+        iconContainer.style.marginBottom = '10px';
+        iconContainer.style.color = '#333';
+        // 创建SVG元素
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        svg.setAttribute('width', '64');
+        svg.setAttribute('height', '64');
+        svg.setAttribute('viewBox', cs_mainicon_viewbox);
+        svg.innerHTML = classification.icon;
+        iconContainer.appendChild(svg);
+        
+        // 创建名称容器
+        const nameContainer = document.createElement('div');
+        nameContainer.className = 'cs-classification-name';
+        nameContainer.style.fontSize = '14px';
+        nameContainer.style.fontWeight = 'bold';
+        nameContainer.style.textAlign = 'center';
+        nameContainer.style.color = '#333';
+        nameContainer.textContent = classification.name;
+        
+        // 创建描述容器
+        const descriptionContainer = document.createElement('div');
+        descriptionContainer.className = 'cs-classification-description';
+        descriptionContainer.style.fontSize = '12px';
+        descriptionContainer.style.textAlign = 'center';
+        descriptionContainer.style.color = '#666';
+        descriptionContainer.style.marginTop = '5px';
+        descriptionContainer.textContent = classification.description;
+        
+        // 组装
+        item.appendChild(iconContainer);
+        item.appendChild(nameContainer);
+        item.appendChild(descriptionContainer);
+        
+        // 为第一个分类项添加点击事件
+        if (index === 0) {
+            item.addEventListener('click', function() {
+                // 新建页面
+                const newPage = new_page();
+
+                // 创建VideoWidget实例并渲染
+                const videoWidget = new CS_VideoWidget();
+                videoWidget.render(newPage);
+            });
+        }
+        
+        // 添加到区域
+        block.appendChild(item);
+    });
+    
+    console.log('分类展示模块：初始化完成');
+}
+
+/**
+* 当模块被激活时的回调函数
+*/
+function classifyShowerActivated() {
+    console.log('分类展示模块：被激活');
+    classifyShowerInit();
+    // 这里可以添加激活时的逻辑，比如发送请求获取分类数据
+    if (socket && socket.isConnected()) {
+        socket.send(JSON.stringify({
+            command: 'CLASSIFY_SHOWER_ACTIVATED'
+        }));
+    }
+}
+
+/**
+* 当模块被休眠时的回调函数
+*/
+function classifyShowerDeactivated() {
+    console.log('分类展示模块：前端部分被休眠');
+    // 这里可以添加休眠时的逻辑
+}
+
+/**
+* 处理接收到的分类数据
+*/
+// function classifyShowerProcessData(data) {
+//     console.log('分类展示模块：收到数据', data);
+//     // 这里可以添加处理分类数据的逻辑
+// }
+
+// 注册到 onload_func_list
+// if (typeof onload_func_list !== 'undefined') {
+//     onload_func_list.push(classifyShowerInit);
+// }
+// 注册到 when_show_func_list
+//set_when_show(CLASSIFY_SHOWER_JS_MODULE_INDEX, classifyShowerInit);
+
+// 设置活跃回调函数
+if (typeof window.set_when_show !== 'undefined') {
+    window.set_when_show(CLASSIFY_SHOWER_JS_MODULE_INDEX, classifyShowerActivated);
+}
+
+// 设置休眠回调函数
+if (typeof window.set_when_hide !== 'undefined') {
+    window.set_when_hide(CLASSIFY_SHOWER_JS_MODULE_INDEX, classifyShowerDeactivated);
+}
+
+// 注册到 message_proc_func_list
+// if (typeof message_proc_func_list !== 'undefined') {
+//     message_proc_func_list.push(function(data) {
+//         if (data.type === 'CS_CLASSIFY_DATA') {
+//             classifyShowerProcessData(data);
+//         }
+//     });
+// }
+
+// 注册到 when_connect_func_list
+if (typeof when_connect_func_list !== 'undefined') {
+    when_connect_func_list.push(function() {
+        console.log('分类展示模块：连接成功');
+        // 连接成功时的逻辑
+    });
+}
+
+// 注册到 when_disconnect_func_list
+if (typeof when_disconnect_func_list !== 'undefined') {
+    when_disconnect_func_list.push(function() {
+        console.log('分类展示模块：连接断开');
+        // 连接断开时的逻辑
+        const block = get_block(CLASSIFY_SHOWER_JS_MODULE_INDEX);
+        if (!block) {
+            console.error('分类展示模块：无法获取分配的区域');
+            return;
+        }
+        // 清空区域内容
+        block.innerHTML = '';
+        // 添加未连接提示
+        const loadingDiv = document.createElement('div');
+        loadingDiv.id = 'treemap-unconnected-div';
+        loadingDiv.className = 'loading';
+        loadingDiv.textContent = '⛔ 未连接后端，请检查服务是否启动';
+        loadingDiv.style.color = '#999';
+        loadingDiv.style.fontSize = '14px';
+        loadingDiv.style.flex = '1';
+        loadingDiv.style.display = 'flex';
+        loadingDiv.style.justifyContent = 'center';
+        loadingDiv.style.alignItems = 'center';
+        block.appendChild(loadingDiv);
+    });
+}
+
+
+let cs_scrollbarStyleSerial = 0;
+
+/**
+ * 为指定 div 创建带自动隐藏效果的美化滚动条。
+ * @param {HTMLElement} div - 已经设置 overflow 的滚动容器。
+ * @param {'vertical'|'horizontal'} direction - 滚动条方向。
+ * @returns {Function} 移除样式、监听器和定时器的清理函数。
+ */
+function cs_beautifyScrollbar(div, direction) {
+    if (!div || !div.classList || typeof div.addEventListener !== 'function') {
+        throw new TypeError('cs_beautifyScrollbar 需要传入可滚动的 div 元素');
+    }
+
+    const isHorizontal = direction === 'horizontal';
+    if (!isHorizontal && direction !== 'vertical') {
+        throw new TypeError('滚动条方向只能是 vertical 或 horizontal');
+    }
+
+    const scrollbarSize = isHorizontal ? 6 : 8;
+    const borderRadius = isHorizontal ? 3 : 4;
+    const gradientDirection = isHorizontal ? '90deg' : '180deg';
+    const instanceId = `${Date.now()}_${++cs_scrollbarStyleSerial}`;
+    const scrollbarClass = `cs-beautified-${direction}-scrollbar-${instanceId}`;
+    const hiddenClass = `${scrollbarClass}-hidden`;
+    const important = isHorizontal ? ' !important' : '';
+
+    const style = document.createElement('style');
+    style.textContent = `
+        .${scrollbarClass}::-webkit-scrollbar {
+            ${isHorizontal ? `height: ${scrollbarSize}px !important;` : `width: ${scrollbarSize}px;`}
+        }
+        .${scrollbarClass}::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0)${important};
+            border-radius: ${borderRadius}px${important};
+        }
+        .${scrollbarClass}::-webkit-scrollbar-thumb {
+            background: linear-gradient(${gradientDirection}, #4a90d9, #6ab0ff)${important};
+            border-radius: ${borderRadius}px${important};
+        }
+        .${scrollbarClass}::-webkit-scrollbar-thumb:hover {
+            background: linear-gradient(${gradientDirection}, #6ab0ff, #4a90d9)${important};
+        }
+        .${scrollbarClass}.${hiddenClass}::-webkit-scrollbar-thumb {
+            background: transparent${important};
+        }
+    `;
+    document.head.appendChild(style);
+
+    let hideTimer = null;
+    let disposed = false;
+    const hideDelay = 2000;
+
+    // 每次显示或隐藏前都重新读取容器尺寸。内容可能在滚动条创建后动态变化，
+    // 不能把初始化时是否溢出的结果长期缓存下来。
+    const hasScrollableOverflow = () => isHorizontal
+        ? div.scrollWidth > div.clientWidth
+        : div.scrollHeight > div.clientHeight;
+
+    const resetScrollbarWhenNotNeeded = () => {
+        if (hasScrollableOverflow()) return false;
+        if (hideTimer) {
+            clearTimeout(hideTimer);
+            hideTimer = null;
+        }
+        div.classList.add(hiddenClass);
+        return true;
+    };
+
+    // 仅同步当前是否仍有溢出。隐藏态只把滑块绘制为透明，始终保留相同的
+    // 原生滚动条槽位，避免切换宽度或 padding 引起换行、scrollHeight 和
+    // scrollTop 连锁变化，进而由程序性 scroll 事件反复唤醒滚动条。
+    const syncScrollbarLayout = () => {
+        if (disposed) return;
+        resetScrollbarWhenNotNeeded();
+    };
+
+    const hideScrollbar = () => {
+        if (disposed) return;
+        if (resetScrollbarWhenNotNeeded()) return;
+        div.classList.add(hiddenClass);
+    };
+
+    const showScrollbar = () => {
+        if (disposed) return;
+        if (resetScrollbarWhenNotNeeded()) return;
+        div.classList.remove(hiddenClass);
+        if (hideTimer) {
+            clearTimeout(hideTimer);
+        }
+        hideTimer = setTimeout(hideScrollbar, hideDelay);
+    };
+
+    div.classList.add(scrollbarClass, hiddenClass);
+    hideScrollbar();
+    div.addEventListener('scroll', showScrollbar);
+    div.addEventListener('mouseenter', showScrollbar);
+
+    // MutationObserver 负责评论、剧集等异步内容的插入和删除；ResizeObserver
+    // 负责容器展开、折叠及窗口布局变化；图片加载则可能只改变内容尺寸而不
+    // 改变 DOM，所以另外监听捕获阶段的 load 事件。
+    const mutationObserver = typeof MutationObserver === 'function'
+        ? new MutationObserver(syncScrollbarLayout)
+        : null;
+    if (mutationObserver) {
+        mutationObserver.observe(div, {
+            childList: true,
+            subtree: true,
+            characterData: true
+        });
+    }
+    const resizeObserver = typeof ResizeObserver === 'function'
+        ? new ResizeObserver(syncScrollbarLayout)
+        : null;
+    if (resizeObserver) resizeObserver.observe(div);
+    div.addEventListener('load', syncScrollbarLayout, true);
+
+    return () => {
+        if (disposed) return;
+        disposed = true;
+        if (hideTimer) {
+            clearTimeout(hideTimer);
+            hideTimer = null;
+        }
+        div.removeEventListener('scroll', showScrollbar);
+        div.removeEventListener('mouseenter', showScrollbar);
+        div.removeEventListener('load', syncScrollbarLayout, true);
+        if (mutationObserver) mutationObserver.disconnect();
+        if (resizeObserver) resizeObserver.disconnect();
+        div.classList.remove(scrollbarClass, hiddenClass);
+        style.remove();
+    };
+}
+
+/**
+ * 美化指定 div 的垂直滚动条，并启用两秒自动隐藏。
+ * @param {HTMLElement} div - 垂直滚动容器。
+ * @returns {Function} 清理函数。
+ */
+function cs_beautifyVerticalScrollbar(div) {
+    return cs_beautifyScrollbar(div, 'vertical');
+}
+
+/**
+ * 美化指定 div 的水平滚动条，并启用两秒自动隐藏。
+ * @param {HTMLElement} div - 水平滚动容器。
+ * @returns {Function} 清理函数。
+ */
+function cs_beautifyHorizontalScrollbar(div) {
+    return cs_beautifyScrollbar(div, 'horizontal');
+}
+
+/**
+ * 为 container 创建返回按钮和根按钮。
+ * @param {HTMLElement} container - 要在其中添加按钮的容器元素。
+ * @returns {HTMLElement} 创建的按钮容器。
+ */
+function cs_createBackButtons(container) {
+    this.widgetId = 'anime_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+    const menuBar = document.createElement('div');
+    menuBar.style.position = 'absolute';
+    menuBar.style.top = '10px';
+    menuBar.style.right = '20px';
+    menuBar.style.display = 'flex';
+    menuBar.style.gap = '10px';
+    menuBar.style.zIndex = '100';
+    menuBar.style.padding = '8px 12px';
+    menuBar.style.background = 'rgba(200, 220, 255, 0.9)';
+    menuBar.style.borderRadius = '20px';
+    menuBar.style.boxShadow = '0 2px 10px rgba(0,0,0,0.1)';
+
+    const createIconButton = (svgString, onClick, viewbox_str) => {
+        const btn = document.createElement('button');
+        btn.style.cssText = 'width:40px;height:40px;border:none;border-radius:50%;background:#4A90D9;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.2s;';
+        btn.innerHTML = `<svg viewBox="${viewbox_str}" width="30" height="30" fill="white">${svgString}</svg>`;
+        btn.onmouseover = () => { btn.style.background = '#357ABD'; btn.style.transform = 'scale(1.05)'; };
+        btn.onmouseout = () => { btn.style.background = '#4A90D9'; btn.style.transform = 'scale(1)'; };
+        btn.onclick = onClick;
+        return btn;
+    };
+
+    const backBtn = createIconButton(cs_return_svg_string, () => pop_page(1), cs_returnicon_viewbox);
+    const rootBtn = createIconButton(cs_home_svg_string, () => pop_page(256), cs_homeicon_viewbox);
+
+    menuBar.appendChild(backBtn);
+    menuBar.appendChild(rootBtn);
+    container.appendChild(menuBar);
+    return menuBar;
+}
+
+function cs_createPopupWindow(title = '', width = '500px') {
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:999;display:none;';
+
+    const menu = document.createElement('div');
+    menu.style.cssText = `position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:${width};max-height:70vh;background:white;border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,0.3);z-index:1000;display:flex;flex-direction:column;`;
+
+    const header = document.createElement('div');
+    header.style.cssText = 'padding:15px;border-bottom:1px solid #eee;display:flex;justify-content:space-between;align-items:center;';
+    header.innerHTML = `<span style="font-size:16px;font-weight:bold;">${title}</span><button id="closePopupBtn" style="padding:6px 12px;border:none;border-radius:4px;background:#f0f0f0;cursor:pointer;font-size:12px;">关闭</button>`;
+    menu.appendChild(header);
+
+    const contentContainer = document.createElement('div');
+    contentContainer.style.cssText = 'flex:1;overflow-y:auto;padding:15px;';
+    menu.appendChild(contentContainer);
+
+    overlay.appendChild(menu);
+    document.body.appendChild(overlay);
+
+    const closeBtn = header.querySelector('#closePopupBtn');
+    closeBtn.onclick = () => {
+        popupDiv.killMe();
+    };
+
+    overlay.onclick = (e) => {
+        if (e.target === overlay) {
+            popupDiv.killMe();
+        }
+    };
+
+    const popupDiv = document.createElement('div');
+
+    popupDiv.popMe = () => {
+        overlay.style.display = 'block';
+    };
+
+    popupDiv.killMe = () => {
+        overlay.style.display = 'none';
+        overlay.remove();
+    };
+
+    popupDiv.appendChild(contentContainer);
+
+    return popupDiv;
+}

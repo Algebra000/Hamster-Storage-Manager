@@ -1,0 +1,383 @@
+关于.cardBg上面文字的渐变规则，是每个
+
+member.user_sailing.cardbg.colors
+"colors": [
+                                "#E29D2FFF",
+                                "#FDC773FF",
+                                "#FDC773FF",
+                                "#E19B2EFF"
+                            ],
+
+"colors"键值的每一项颜色对应
+
+member.user_sailing.cardbg.gradients
+"gradients": [
+                                0,
+                                33,
+                                67,
+                                100
+                            ]
+
+"gradients"键值的每一项百分比。例如
+
+                            "colors": [
+                                "#E29D2FFF",
+                                "#FDC773FF",
+                                "#FDC773FF",
+                                "#E19B2EFF"
+                            ],
+                            "gradients": [
+                                0,
+                                33,
+                                67,
+                                100
+                            ]
+
+这个用户的数据体现在style上就应该是“background-image: linear-gradient(135deg, rgb(226, 157, 47) 0%, rgb(253, 199, 115) 33%, rgb(253, 199, 115) 67%, rgb(225, 155, 46) 100%); -webkit-text-fill-color: transparent; background-clip: text;”
+
+
+——————————————————————————————————————
+
+
+
+另外用户头像就是这个.avatar<a>标签里结构原有的生成逻辑从py里删除，作废。包括回复评论的用户的.reply-avatar<a>标签。新的头像绘制逻辑通过解析"layers"嵌套列表实现。如果是评论用户，尝试读取"member"键值里的"avatar_item"键。多数情况下"avatar_item"的值里存在"fallback_layers"，layers嵌套列表即"fallback_layers"下面的"layers"键值，例如
+
+                "fallback_layers": {
+                    "layers": [
+                        {
+                            "visible": true,
+                            "general_spec": {
+                                "pos_spec": {
+                                    "coordinate_pos": 2,
+                                    "axis_x": 0.9,
+                                    "axis_y": 0.9
+                                },
+                                "size_spec": {
+                                    "width": 1,
+                                    "height": 1
+                                },
+                                "render_spec": {
+                                    "opacity": 1
+                                }
+                            },
+                            "layer_config": {
+                                "tags": {
+                                    "AVATAR_LAYER": {},
+                                    "GENERAL_CFG": {
+                                        "config_type": 1,
+                                        "general_config": {
+                                            "web_css_style": {
+                                                "borderRadius": "50%"
+                                            }
+                                        }
+                                    }
+                                },
+                                "is_critical": true
+                            },
+                            "resource": {
+                                "res_type": 3,
+                                "res_image": {
+                                    "image_src": {
+                                        "src_type": 1,
+                                        "placeholder": 6,
+                                        "remote": {
+                                            "url": "https://i1.hdslb.com/bfs/face/c83486969cf5f2df6a5f7e32ec701ad5a5efde46.jpg",
+                                            "bfs_style": "widget-layer-avatar"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    ],
+                    "is_critical_group": true
+                },
+
+
+少数情况下"avatar_item"的值里既存在"fallback_layers"键又存在"layers"键，"layers"键值也是一个layers嵌套列表，这种情况下优先使用"layers"键值来绘制头像而忽略"fallback_layers"键值里的那个"layers"键值。例如
+
+                "layers": [
+                    {
+                        "layers": [
+                            {
+                                "visible": true,
+                                "general_spec": {
+                                    "pos_spec": {
+                                        "coordinate_pos": 2,
+                                        "axis_x": 0.9,
+                                        "axis_y": 0.9
+                                    },
+                                    "size_spec": {
+                                        "width": 1.6,
+                                        "height": 1.6
+                                    },
+                                    "render_spec": {
+                                        "opacity": 1
+                                    }
+                                },
+                                "layer_config": {
+                                    "tags": {
+                                        "AVATAR_LAYER": {}
+                                    },
+                                    "is_critical": true
+                                },
+                                "resource": {
+                                    "res_type": 4,
+                                    "res_animation": {
+                                        "webp_src": {
+                                            "src_type": 1,
+                                            "remote": {
+                                                "url": "https://i0.hdslb.com/bfs/baselabs/dc29f192d2e822fdea46b581c4aad752f394add3.webp",
+                                                "bfs_style": "widget-layer-avatar"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        ],
+                        "is_critical_group": true
+                    },
+                    {
+                        "layers": [
+                            {
+                                "visible": true,
+                                "general_spec": {
+                                    "pos_spec": {
+                                        "coordinate_pos": 1,
+                                        "axis_x": 1.125,
+                                        "axis_y": 1.225
+                                    },
+                                    "size_spec": {
+                                        "width": 0.41666666666666663,
+                                        "height": 0.41666666666666663
+                                    },
+                                    "render_spec": {
+                                        "opacity": 1
+                                    }
+                                },
+                                "layer_config": {
+                                    "tags": {
+                                        "GENERAL_CFG": {
+                                            "config_type": 1,
+                                            "general_config": {
+                                                "web_css_style": {
+                                                    "background-color": "rgb(255,255,255)",
+                                                    "border": "2px solid rgba(255,255,255,1)",
+                                                    "borderRadius": "50%",
+                                                    "boxSizing": "border-box"
+                                                }
+                                            }
+                                        },
+                                        "ICON_LAYER": {}
+                                    }
+                                },
+                                "resource": {
+                                    "res_type": 4,
+                                    "res_animation": {
+                                        "webp_src": {
+                                            "src_type": 1,
+                                            "placeholder": 5,
+                                            "remote": {
+                                                "url": "https://i0.hdslb.com/bfs/activity-plat/static/20220506/334553dd7c506a92b88eaf4d59ac8b4d/j8AeXAkEul.gif",
+                                                "bfs_style": "widget-layer-avatar"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                ],
+                "fallback_layers": {
+                    "layers": [
+                        {
+                            "visible": true,
+                            "general_spec": {
+                                "pos_spec": {
+                                    "coordinate_pos": 2,
+                                    "axis_x": 0.9,
+                                    "axis_y": 0.9
+                                },
+                                "size_spec": {
+                                    "width": 1.3,
+                                    "height": 1.3
+                                },
+                                "render_spec": {
+                                    "opacity": 1
+                                }
+                            },
+                            "layer_config": {
+                                "tags": {
+                                    "AVATAR_LAYER": {},
+                                    "GENERAL_CFG": {
+                                        "config_type": 1,
+                                        "general_config": {
+                                            "web_css_style": {
+                                                "borderRadius": "50%"
+                                            }
+                                        }
+                                    }
+                                },
+                                "is_critical": true
+                            },
+                            "resource": {
+                                "res_type": 3,
+                                "res_image": {
+                                    "image_src": {
+                                        "src_type": 1,
+                                        "placeholder": 6,
+                                        "remote": {
+                                            "url": "https://i0.hdslb.com/bfs/baselabs/58c04afa9a907af218bde2e32505a66df6a6eb75.png",
+                                            "bfs_style": "widget-layer-avatar"
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "visible": true,
+                            "general_spec": {
+                                "pos_spec": {
+                                    "coordinate_pos": 1,
+                                    "axis_x": 1.175,
+                                    "axis_y": 1.175
+                                },
+                                "size_spec": {
+                                    "width": 0.41666666666666663,
+                                    "height": 0.41666666666666663
+                                },
+                                "render_spec": {
+                                    "opacity": 1
+                                }
+                            },
+                            "layer_config": {
+                                "tags": {
+                                    "GENERAL_CFG": {
+                                        "config_type": 1,
+                                        "general_config": {
+                                            "web_css_style": {
+                                                "background-color": "rgb(255,255,255)",
+                                                "border": "2px solid rgba(255,255,255,1)",
+                                                "borderRadius": "50%",
+                                                "boxSizing": "border-box"
+                                            }
+                                        }
+                                    },
+                                    "ICON_LAYER": {}
+                                }
+                            },
+                            "resource": {
+                                "res_type": 4,
+                                "res_animation": {
+                                    "webp_src": {
+                                        "src_type": 1,
+                                        "placeholder": 5,
+                                        "remote": {
+                                            "url": "https://i0.hdslb.com/bfs/activity-plat/static/20220506/334553dd7c506a92b88eaf4d59ac8b4d/j8AeXAkEul.gif",
+                                            "bfs_style": "widget-layer-avatar"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    ],
+                    "is_critical_group": true
+                },
+
+如果是回复评论的用户，相应的"avatar_item"的值要从“replies”键值列表每一项里去找，对应的读取与绘制方式与评论用户相同。
+
+在解析layers嵌套列表前，先从包含它的"avatar_item"里尝试读取"container_size"键值，读取其下面的"width"和
+"height"值，如果读取不到默认都是1.8。然后从相应的<a>里建立一个长为<a>长度"width"倍、高为<a>高度"height"倍的div元素(画布div)，此后对于头像的所有绘制发生在其上。例如
+
+member.avatar_item.container_size
+                "container_size": {
+                    "width": 1.8,
+                    "height": 1.8
+                },
+
+称<a>长度为基准长度，<a>高度为基准高度
+
+关于layers嵌套列表的解析，对于这个列表里的每一项(图层项)，在画布div里建立一个layers DIV，称作图层div。图层div的顺序对应其在列表里的顺序，列表的最后一项显示在最上面。尝试读取图层项里的"visible"，如果可以获取到值且值为 true 那么继续绘制，如果不是这样则跳过绘制直接开始尝试读取"layers"。层的绘制步骤需要读取general_spec.pos_spec.axis_x与general_spec.pos_spec.axis_y作为图片绘制的位置点。关于general_spec.pos_spec这个位置指的是图层中心位置还是左上角位置取决于general_spec.pos_spec.coordinate_pos这个值。值为1指的是左上角位置，值为2指的是中心位置。例如
+
+                                    "pos_spec": {
+                                        "coordinate_pos": 2,
+                                        "axis_x": 0.9,
+                                        "axis_y": 0.9
+                                    },
+
+默认这两个数都是0.9,其含义是这两个数乘以基准长/高度取整得到相对于画布div左上角的x/y坐标。然后读取general_spec.size_spec.width和general_spec.size_spec.height，这两个含义是相对基准长/高度的倍数，其决定了图片资源的大小。例如。读取general_spec.render_spec.opacity，其决定了图片资源的透明度，默认1，例如
+
+                                    "render_spec": {
+                                        "opacity": 1
+                                    }
+
+然后获取图片资源src。读取resource.res_type,不同值读取方式不同：
+
+值4(动画图片)：读取resource.res_animation.webp_src.remote.url作为图片src，例如
+
+                                "resource": {
+                                    "res_type": 4,
+                                    "res_animation": {
+                                        "webp_src": {
+                                            "src_type": 1,
+                                            "remote": {
+                                                "url": "https://i0.hdslb.com/bfs/baselabs/dc29f192d2e822fdea46b581c4aad752f394add3.webp",
+                                                "bfs_style": "widget-layer-avatar"
+                                            }
+                                        }
+                                    }
+                                }
+
+值3(静态图片)：读取resource.res_image.image_src.remote.url作为图片src，例如
+
+                            "resource": {
+                                "res_type": 3,
+                                "res_image": {
+                                    "image_src": {
+                                        "src_type": 1,
+                                        "placeholder": 6,
+                                        "remote": {
+                                            "url": "https://i0.hdslb.com/bfs/baselabs/58c04afa9a907af218bde2e32505a66df6a6eb75.png",
+                                            "bfs_style": "widget-layer-avatar"
+                                        }
+                                    }
+                                }
+                            }
+
+应该目前只支持这两个值。读取静态图片的src时，当resource.res_image.image_src.src_type = 1时表示为远程文件，resource.res_image.image_src.remote.url这个键值可以读取到；resource.res_image.image_src.src_type = 2时表示为本地资源，此时读取资源号resource.res_image.image_src.local，该图片的src应为f"./bilibili-resource/res-local{local}.png"。
+
+然后读取layer_config.tags.GENERAL_CFG.general_config.web_css_style，将其中的键值对全部以style=""的形式加到图片元素上。例如
+
+                                "layer_config": {
+                                    "tags": {
+                                        "GENERAL_CFG": {
+                                            "config_type": 1,
+                                            "general_config": {
+                                                "web_css_style": {
+                                                    "background-color": "rgb(255,255,255)",
+                                                    "border": "2px solid rgba(255,255,255,1)",
+                                                    "borderRadius": "50%",
+                                                    "boxSizing": "border-box"
+                                                }
+                                            }
+                                        },
+                                        "ICON_LAYER": {}
+                                    }
+                                },
+
+在绘制完成后，尝试读取"layers"值，如果未定义该值，读取不到，那么完成这个图层项的解析。如果读取到了"layers"值而且为非空列表，那么这个列表是layers嵌套列表，说明这个图层div里面还应该有子图层div，那么在这个图层div里继续建立图层div，重复以上步骤。注意这里的实现不能使用递归函数，而应该使用循环来解决，并且layers嵌套列表的解析应该放到单独一个函数里。
+
+
+然后如果一个图层项"visible"获取不到或为false，也不应该直接continue跳过，而仍然在画布里插入空样式div图层，然后再尝试在图层项里读取"layers"，因为即使这个图层项"visible"为false，图层项也可能嵌套了大量可见的图层。
+
+
+————————————————————————————————————————
+
+接下来实现回复折叠功能。如果一评论的“replies”列表长度超过2，那么只在html上展示前两条回复，然后在两条回复下面显示一行可点击的小灰字“共XX条回复，点击查看”，点击则展开回复。如果“replies”列表长度不超过10，直接展开所有回复。
+
+如果“replies”列表长度大于10，那么点击后则展开前10条回复，并在最下方显示一行字“共x页   ”“1 2 ... xx  下一页”“收起” ，其中“1 2 ... xx  下一页”用蓝色字体标出当前页码，点击对应页码则显示相应页码的回复。点击“下一页”显示下一个页码，点击“收起”则重新折叠评论，回到展示前两条回复的状态。
+
+然后如果超过6页下面的页码表就要有省略号，例如“1 2 3 4 5 ... 9  下一页”。如果当前在前3页，那么省略号都是这个位置“1 2 3 4 5 ... 9  下一页”。如果在后三页“1 ... 5 6 7 8 9  下一页”。如果既不是在前3页又不是在后3页，那么要维持显示当前页码的前两页与后两页，以及第1页和最后一页，其他省略号，例如在第4页：“1 2 3 4 5 6 ... 9  下一页”，在第5页“1 ... 3 4 5 6 7 ... 9  下一页”
+
+然后加一个新的逻辑按钮“上一页”。以9页为例，如果在第一页，不显示“上一页”，显示“1 2 3 4 5 ... 9  下一页”；如果既不在第1页也不在最后一页，那“上一页”“下一页”都显示。例如4页显示“上一页 1 2 3 4 5 6 ... 9  下一页”。如果在最后一页不显示“下一页”，即是“上一页 1 ... 5 6 7 8 9 ”。点击上一页则返回上一页。
+
+还有切换页面前后页面往往长度发生变化，这时候要保证在点击页码或“上一页”“下一页”“收起”后“1 2 3 4 5 ... 9  下一页”这个reply-pagination相对屏幕的y方向位置尽量不发生变化。相对屏幕的y方向位置尽量不发生变化的含义是，例如现在屏幕下边缘对应.comment-list的y方向3000px,然后.reply-pagination对应.comment-list的y坐标是2500px，假设点击“收起”后.reply-pagination对应.comment-list的y坐标变成1500px，那么现在的屏幕下边缘应该对应.comment-list的y方向2000px。所以position: sticky;不是合适的选择。

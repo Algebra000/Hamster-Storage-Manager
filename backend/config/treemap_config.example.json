@@ -1,0 +1,7 @@
+{
+  "draw_tree_max_depth": 5,
+  "fragmented_threshold_mode": "percentage",
+  "fragmented_threshold_percentage": 0.4,
+  "fragmented_threshold_size": 100,
+  "fragmented_threshold_unit": "MB"
+}

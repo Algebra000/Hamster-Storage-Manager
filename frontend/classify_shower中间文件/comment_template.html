@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>B站评论展示</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background-color: #f5f5f5;
+            min-height: 100vh;
+        }
+        @font-face {
+            font-family: "HarmonyOS_Regular";
+            src: url("./bilibili-resource/HarmonyOS-Regular-subset1.woff") format("woff");
+        }
+        @font-face {
+            font-family: 'fans-num';
+            src: url("./bilibili-resource/fans-num.ttf") format("truetype");
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .header {
+            background: linear-gradient(135deg, #fb7299 0%, #ff7cce 100%);
+            color: white;
+            padding: 24px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 12px rgba(251, 114, 153, 0.3);
+        }
+        .header h1 {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+        .header p {
+            opacity: 0.9;
+            font-size: 14px;
+        }
+        .comment-list {
+            background: white;
+            border-radius: 12px;
+            padding: 16px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+        }
+        .comment-item {
+            padding: 16px 0;
+            border-bottom: 1px solid #f0f0f0;
+            position: relative;
+        }
+        .comment-item:last-child {
+            border-bottom: none;
+        }
+        .comment-header {
+            display: flex;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+        .avatar {
+            width: 48px;
+            height: 48px;
+            margin-right: 12px;
+            flex-shrink: 0;
+            border: 2px solid transparent;
+            position: relative;
+            overflow: visible;
+        }
+        .avatar-canvas {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+        }
+        .avatar-layer {
+            position: absolute;
+        }
+        .avatar-layer img {
+            display: block;
+        }
+        .user-info {
+            flex: 1;
+            min-width: 0;
+        }
+        .username {
+            font-weight: 600;
+            font-size: 15px;
+            color: #18191c;
+            margin-bottom: 4px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .level-badge {
+            width: 30px;
+            height: 30px;
+        }
+        .vip-username {
+            color: #fb7299;
+        }
+        .reply-username.vip-username {
+            color: #fb7299;
+        }
+        .vip-avatar-badge {
+            position: absolute;
+            bottom: 0;
+            right: 0;
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            border: 2px solid white;
+            box-sizing: content-box;
+            z-index: 2;
+        }
+        .meta-info {
+            font-size: 12px;
+            color: #9499a0;
+            display: flex;
+            gap: 12px;
+        }
+        .comment-content {
+            margin-left: 60px;
+            margin-bottom: 12px;
+            line-height: 24px;
+            font-size: 15px;
+            color: #18191c;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .comment-content img {
+            vertical-align: text-bottom;
+            max-height: 24px;
+            margin: 0 2px;
+        }
+        .comment-picture {
+            margin-left: 60px;
+            margin-top: 8px;
+            margin-bottom: 6px;
+        }
+        .comment-picture.single img {
+            max-width: 210px;
+            max-height: 180px;
+            border-radius: 6px;
+            cursor: zoom-in;
+        }
+        .comment-picture.grid {
+            display: grid;
+            grid-template-columns: repeat(4, 92px);
+            gap: 4px;
+        }
+        .comment-picture.grid .picture-item {
+            width: 88px;
+            height: 88px;
+            border-radius: 6px;
+            overflow: hidden;
+            cursor: zoom-in;
+            position: relative;
+        }
+        .comment-picture.grid .picture-item img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        .image-preview-modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+        .image-preview-modal.active {
+            display: flex;
+        }
+        .image-preview-modal img {
+            max-width: 90%;
+            max-height: 90%;
+            cursor: zoom-in;
+            transition: transform 0.2s ease;
+        }
+        .image-preview-modal img.zoomed {
+            max-width: none;
+            max-height: none;
+            cursor: grab;
+        }
+        .image-preview-modal img.zoomed:active {
+            cursor: grabbing;
+        }
+        .image-preview-modal .close-btn {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            width: 40px;
+            height: 40px;
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 50%;
+            color: white;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+            cursor: pointer;
+        }
+        .image-preview-modal .nav-btn {
+            position: absolute;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 44px;
+            height: 44px;
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 50%;
+            color: white;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 28px;
+            cursor: pointer;
+            user-select: none;
+        }
+        .image-preview-modal .nav-btn:hover {
+            background: rgba(255, 255, 255, 0.4);
+        }
+        .image-preview-modal .nav-btn.disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+        .image-preview-modal .nav-btn.disabled:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+        .image-preview-modal .prev-btn {
+            left: 20px;
+        }
+        .image-preview-modal .next-btn {
+            right: 20px;
+        }
+        .image-preview-modal .image-counter {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            font-family: "HarmonyOS_Regular";
+            font-size: 16px;
+            color: white;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 6px 12px;
+            border-radius: 4px;
+        }
+        .comment-item {
+            position: relative;
+        }
+        .cardBg {
+            position: absolute;
+            top: 0;
+            right: 0;
+            height: 48px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+        }
+        .cardBg img {
+            height: 100%;
+            border-radius: 4px;
+        }
+        .cardBg .card-text {
+            position: absolute;
+            right: 0;
+            top: 50%;
+            transform: translateY(-50%);
+            font-family: 'fans-num';
+            font-size: 10px;
+            line-height: 12px;
+            text-align: left;
+            display: flex;
+            flex-direction: column;
+            padding-right: 4px;
+        }
+        .cardBg .card-text span {
+            display: block;
+        }
+        .cardBg .tooltip {
+            display: none;
+            position: absolute;
+            top: calc(100% - 10px);
+            left: calc(100% - 20px);
+            border: 1px solid gainsboro;
+            background: white;
+            color: black;
+            padding: 8px 12px;
+            border-radius: 8px;
+            font-size: 12px;
+            white-space: nowrap;
+            z-index: 100;
+            margin-bottom: 8px;
+            box-shadow: rgba(0, 0, 0, 0.1) 0px 0px 30px 2px;
+        }
+        .cardBg:hover .tooltip {
+            display: block;
+        }
+        .cardBg .tooltip .tooltip-name {
+            font-weight: bold;
+            margin-bottom: 4px;
+        }
+        .cardBg .tooltip .tooltip-id {
+            color: #9499a0;
+        }
+        .comment-footer {
+            margin-left: 60px;
+            display: flex;
+            align-items: center;
+            gap: 24px;
+        }
+        .action-btn {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 13px;
+            color: #9499a0;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .action-btn:hover {
+            color: #00A1D6;
+        }
+        .action-btn:hover img {
+            filter: invert(39%) sepia(90%) saturate(2000%) hue-rotate(170deg) brightness(95%) contrast(100%);
+        }
+        .action-btn span {
+            font-weight: 500;
+        }
+        .jump-link {
+            color: #008AC5;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 1px;
+            vertical-align: bottom;
+        }
+        .jump-link:hover {
+            color: #00aeec;
+        }
+        .timestamp {
+            color: #9499a0;
+            font-size: 13px;
+            font-family: "HarmonyOS_Regular",Helvetica Neue, Microsoft YaHei, sans-serif !important;
+        }
+        .reply-section {
+            margin-top: 12px;
+            margin-left: 60px;
+            padding-left: 16px;
+            border-left: 2px solid #e9e9eb;
+        }
+        .reply-item {
+            padding: 12px 0;
+            border-bottom: 1px solid #f5f5f5;
+        }
+        .reply-item:last-child {
+            border-bottom: none;
+        }
+        .reply-header {
+            display: flex;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        .reply-avatar {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            overflow: visible;
+            margin-right: 10px;
+            flex-shrink: 0;
+            position: relative;
+        }
+        .reply-avatar .avatar-canvas {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+        }
+        .reply-avatar .avatar-layer {
+            position: absolute;
+        }
+        .reply-avatar .avatar-layer img {
+            display: block;
+        }
+        .reply-username {
+            font-weight: 500;
+            font-size: 14px;
+            color: #18191c;
+            margin-bottom: 2px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .reply-meta {
+            font-size: 11px;
+            color: #9499a0;
+        }
+        .reply-content {
+            margin-left: 46px;
+            line-height: 1.6;
+            font-size: 14px;
+            color: #18191c;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .reply-content img {
+            vertical-align: text-bottom;
+            max-height: 20px;
+            margin: 0 2px;
+        }
+        .reply-footer {
+            margin-left: 46px;
+            margin-top: 8px;
+            display: flex;
+            align-items: center;
+            gap: 24px;
+        }
+        .expand-btn {
+            margin-left: 60px;
+            margin-top: 8px;
+            color: #00a1d6;
+            font-size: 13px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .expand-btn:hover {
+            text-decoration: underline;
+        }
+        .reply-expand-btn {
+            margin-top: 8px;
+            color: #9499a0;
+            font-size: 13px;
+            cursor: pointer;
+        }
+        .reply-expand-btn:hover {
+            color: #00a1d6;
+        }
+        .reply-pagination {
+            margin-left: 60px;
+            margin-top: 12px;
+            margin-bottom: 8px;
+            font-size: 13px;
+            color: #000000;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            flex-wrap: wrap;
+            bottom: 0;
+            background: white;
+            z-index: 10;
+        }
+        .reply-pagination .page-count {
+            margin-right: 10px;
+        }
+        .reply-pagination .page-num {
+            color: #000000;
+            cursor: pointer;
+            padding: 2px 1px;
+        }
+        .reply-pagination .page-num:hover {
+            color: #00AEEC;
+        }
+        .reply-pagination .page-num.active {
+            color: #00AEEC;
+        }
+        .reply-pagination .page-ellipsis {
+            color: #000000;
+        }
+        .reply-pagination .page-btn {
+            color: #000000;
+            cursor: pointer;
+        }
+        .reply-pagination .page-btn:hover {
+            color: #00AEEC;
+        }
+        .count-badge {
+            display: inline-block;
+            background: #f4f4f4;
+            color: #9499a0;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+        <div class="comment-list">
+            
+        </div>
+    <div class="image-preview-modal" id="imagePreviewModal">
+        <div class="close-btn" onclick="closePreview()">
+            <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="20" height="20" viewBox="0 0 20 20">
+                <path d="M4.106275 4.108583333333334C4.350341666666667 3.8645000000000005 4.746083333333333 3.8645000000000005 4.9901583333333335 4.108583333333334L9.998666666666667 9.117125L15.008583333333334 4.107216666666667C15.252625 3.8631333333333338 15.648375000000001 3.8631333333333338 15.892458333333334 4.107216666666667C16.136541666666666 4.351291666666667 16.136541666666666 4.747025000000001 15.892458333333334 4.9911L10.882541666666667 10.001000000000001L15.891375 15.009791666666667C16.135458333333332 15.253874999999999 16.135458333333332 15.649625 15.891375 15.893708333333334C15.647291666666668 16.13775 15.251541666666668 16.13775 15.0075 15.893708333333334L9.998666666666667 10.884875000000001L4.991233333333334 15.892333333333333C4.747158333333333 16.13641666666667 4.351425 16.13641666666667 4.10735 15.892333333333333C3.8632750000000002 15.648249999999999 3.8632750000000002 15.252541666666666 4.10735 15.008458333333333L9.114791666666667 10.001000000000001L4.106275 4.992466666666667C3.8621916666666665 4.7483916666666675 3.8621916666666665 4.352658333333333 4.106275 4.108583333333334z" fill="currentColor"></path>
+            </svg>
+        </div>
+        <div class="image-counter" id="imageCounter"></div>
+        <div class="nav-btn prev-btn" id="prevBtn" onclick="navigatePreview(-1)">
+            <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="20" height="20" viewBox="0 0 20 20">
+                <path d="M12.733583333333334 2.6830583333333333C12.977666666666668 2.927141666666667 12.977666666666668 3.3228666666666666 12.733583333333334 3.566941666666667L6.595175 9.705375C6.432458333333334 9.868125 6.432458333333334 10.131875 6.595175 10.294625L12.733583333333334 16.433041666666668C12.977666666666668 16.677125 12.977666666666668 17.072875 12.733583333333334 17.316958333333332C12.489541666666668 17.561 12.093791666666666 17.561 11.849708333333334 17.316958333333332L5.711291666666667 11.1785C5.060416666666667 10.527625 5.060416666666667 9.472375 5.711291666666667 8.8215L11.849708333333334 2.6830583333333333C12.093791666666666 2.4389833333333333 12.489541666666668 2.4389833333333333 12.733583333333334 2.6830583333333333z" fill="currentColor"></path>
+            </svg>
+        </div>
+        <img id="previewImage" src="" alt="预览图片">
+        <div class="nav-btn next-btn" id="nextBtn" onclick="navigatePreview(1)">
+            <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="20" height="20" viewBox="0 0 20 20" style="transform: rotate(180deg);">
+                <path d="M12.733583333333334 2.6830583333333333C12.977666666666668 2.927141666666667 12.977666666666668 3.3228666666666666 12.733583333333334 3.566941666666667L6.595175 9.705375C6.432458333333334 9.868125 6.432458333333334 10.131875 6.595175 10.294625L12.733583333333334 16.433041666666668C12.977666666666668 16.677125 12.977666666666668 17.072875 12.733583333333334 17.316958333333332C12.489541666666668 17.561 12.093791666666666 17.561 11.849708333333334 17.316958333333332L5.711291666666667 11.1785C5.060416666666667 10.527625 5.060416666666667 9.472375 5.711291666666667 8.8215L11.849708333333334 2.6830583333333333C12.093791666666666 2.4389833333333333 12.489541666666668 2.4389833333333333 12.733583333333334 2.6830583333333333z" fill="currentColor"></path>
+            </svg>
+        </div>
+    </div>
+    <script>
+        var isZoomed = false;
+        var isDragging = false;
+        var dragMoved = false;
+        var startX, startY, translateX = 0, translateY = 0;
+        var currentImages = [];
+        var currentIndex = 0;
+        const REPLY_PAGE_SIZE = 5;
+
+        function previewImage(images, index) {
+            if (typeof images === 'string') {
+                currentImages = [images];
+                currentIndex = 0;
+            } else {
+                currentImages = images;
+                currentIndex = index;
+            }
+            showImage();
+            var modal = document.getElementById('imagePreviewModal');
+            modal.classList.add('active');
+            document.body.style.overflow = 'hidden';
+        }
+
+        function showImage() {
+            var img = document.getElementById('previewImage');
+            img.src = currentImages[currentIndex];
+            img.classList.remove('zoomed');
+            img.style.transform = 'translate(0, 0)';
+            isZoomed = false;
+            isDragging = false;
+            dragMoved = false;
+            translateX = 0;
+            translateY = 0;
+            updateNavButtons();
+            updateImageCounter();
+        }
+
+        function updateImageCounter() {
+            var counter = document.getElementById('imageCounter');
+            if (currentImages.length > 1) {
+                counter.textContent = (currentIndex + 1) + ' / ' + currentImages.length;
+            } else {
+                counter.textContent = '';
+            }
+        }
+
+        function updateNavButtons() {
+            var prevBtn = document.getElementById('prevBtn');
+            var nextBtn = document.getElementById('nextBtn');
+            prevBtn.classList.toggle('disabled', currentIndex <= 0);
+            nextBtn.classList.toggle('disabled', currentIndex >= currentImages.length - 1);
+        }
+
+        function navigatePreview(direction) {
+            var newIndex = currentIndex + direction;
+            if (newIndex < 0 || newIndex >= currentImages.length) return;
+            currentIndex = newIndex;
+            showImage();
+        }
+
+        function closePreview() {
+            var modal = document.getElementById('imagePreviewModal');
+            modal.classList.remove('active');
+            document.body.style.overflow = '';
+        }
+
+        document.getElementById('previewImage').addEventListener('click', function(e) {
+            e.stopPropagation();
+            if (dragMoved) {
+                dragMoved = false;
+                return;
+            }
+            if (!isZoomed) {
+                this.classList.add('zoomed');
+                isZoomed = true;
+            } else {
+                this.classList.remove('zoomed');
+                this.style.transform = 'translate(0, 0)';
+                isZoomed = false;
+                translateX = 0;
+                translateY = 0;
+            }
+        });
+
+        document.getElementById('previewImage').addEventListener('mousedown', function(e) {
+            if (!isZoomed) return;
+            e.preventDefault();
+            isDragging = true;
+            dragMoved = false;
+            startX = e.clientX - translateX;
+            startY = e.clientY - translateY;
+        });
+
+        document.addEventListener('mousemove', function(e) {
+            if (!isZoomed || !isDragging) return;
+            dragMoved = true;
+            translateX = e.clientX - startX;
+            translateY = e.clientY - startY;
+            document.getElementById('previewImage').style.transform = 'translate(' + translateX + 'px, ' + translateY + 'px)';
+        });
+
+        document.addEventListener('mouseup', function(e) {
+            if (!isZoomed) return;
+            isDragging = false;
+        });
+
+        document.getElementById('imagePreviewModal').addEventListener('click', function(e) {
+            if (e.target === this) {
+                closePreview();
+            }
+        });
+
+        function toggleReplies(commentId, totalCount) {
+            var container = document.getElementById('reply-container-' + commentId);
+            var expandBtn = document.querySelector('.reply-section #reply-container-' + commentId + ' + .reply-expand-btn');
+            var pagination = document.getElementById('reply-pagination-' + commentId);
+            var items = container.querySelectorAll('.reply-item');
+            
+            var isCollapsed = expandBtn && expandBtn.style.display !== 'none';
+            
+            if (isCollapsed) {
+                var showCount = totalCount <= REPLY_PAGE_SIZE ? totalCount : REPLY_PAGE_SIZE;
+                for (var i = 0; i < items.length; i++) {
+                    if (i < showCount) {
+                        items[i].style.display = '';
+                    } else {
+                        items[i].style.display = 'none';
+                    }
+                }
+                if (expandBtn) expandBtn.style.display = 'none';
+                if (pagination && totalCount > REPLY_PAGE_SIZE) {
+                    pagination.style.display = '';
+                    updatePagination(commentId, 1, totalCount);
+                }
+            } else {
+                for (var i = 0; i < items.length; i++) {
+                    if (i < 2) {
+                        items[i].style.display = '';
+                    } else {
+                        items[i].style.display = 'none';
+                    }
+                }
+                if (expandBtn) expandBtn.style.display = '';
+                if (pagination) pagination.style.display = 'none';
+            }
+        }
+
+        function showReplyPage(commentId, pageNum, totalCount) {
+            var container = document.getElementById('reply-container-' + commentId);
+            var items = container.querySelectorAll('.reply-item');
+            var startIndex = (pageNum - 1) * REPLY_PAGE_SIZE;
+            var endIndex = startIndex + REPLY_PAGE_SIZE;
+            
+            for (var i = 0; i < items.length; i++) {
+                if (i >= startIndex && i < endIndex) {
+                    items[i].style.display = '';
+                } else {
+                    items[i].style.display = 'none';
+                }
+            }
+            
+            var pagination = document.getElementById('reply-pagination-' + commentId);
+            updatePagination(commentId, pageNum, totalCount);
+        }
+
+        function updatePagination(commentId, currentPage, totalCount) {
+            var pagination = document.getElementById('reply-pagination-' + commentId);
+            var totalPages = Math.ceil(totalCount / REPLY_PAGE_SIZE);
+            
+            var html = '<span class="page-count">共' + totalPages + '页</span>';
+            
+            if (currentPage > 1) {
+                html += '<span class="page-btn" onclick="showReplyPage(' + commentId + ', ' + (currentPage - 1) + ', ' + totalCount + ')">上一页</span>';
+            }
+            
+            if (totalPages <= 6) {
+                for (var i = 1; i <= totalPages; i++) {
+                    html += '<span class="page-num' + (i === currentPage ? ' active' : '') + '" onclick="showReplyPage(' + commentId + ', ' + i + ', ' + totalCount + ')">' + i + '</span>';
+                }
+            } else {
+                if (currentPage <= 3) {
+                    for (var i = 1; i <= 5; i++) {
+                        html += '<span class="page-num' + (i === currentPage ? ' active' : '') + '" onclick="showReplyPage(' + commentId + ', ' + i + ', ' + totalCount + ')">' + i + '</span>';
+                    }
+                    html += '<span class="page-ellipsis">...</span>';
+                    html += '<span class="page-num" onclick="showReplyPage(' + commentId + ', ' + totalPages + ', ' + totalCount + ')">' + totalPages + '</span>';
+                } else if (currentPage >= totalPages - 2) {
+                    html += '<span class="page-num" onclick="showReplyPage(' + commentId + ', 1, ' + totalCount + ')">1</span>';
+                    html += '<span class="page-ellipsis">...</span>';
+                    for (var i = totalPages - 4; i <= totalPages; i++) {
+                        html += '<span class="page-num' + (i === currentPage ? ' active' : '') + '" onclick="showReplyPage(' + commentId + ', ' + i + ', ' + totalCount + ')">' + i + '</span>';
+                    }
+                } else {
+                    html += '<span class="page-num" onclick="showReplyPage(' + commentId + ', 1, ' + totalCount + ')">1</span>';
+                    html += '<span class="page-ellipsis">...</span>';
+                    for (var i = currentPage - 2; i <= currentPage + 2; i++) {
+                        html += '<span class="page-num' + (i === currentPage ? ' active' : '') + '" onclick="showReplyPage(' + commentId + ', ' + i + ', ' + totalCount + ')">' + i + '</span>';
+                    }
+                    html += '<span class="page-ellipsis">...</span>';
+                    html += '<span class="page-num" onclick="showReplyPage(' + commentId + ', ' + totalPages + ', ' + totalCount + ')">' + totalPages + '</span>';
+                }
+            }
+            
+            if (currentPage < totalPages) {
+                html += '<span class="page-btn" onclick="showReplyPage(' + commentId + ', ' + (currentPage + 1) + ', ' + totalCount + ')">下一页</span>';
+            }
+            
+            html += '<span class="page-btn" onclick="toggleReplies(' + commentId + ', ' + totalCount + ')">收起</span>';
+            
+            pagination.innerHTML = html;
+        }
+    </script>
+</body>
+</html>

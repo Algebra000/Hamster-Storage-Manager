@@ -1,0 +1,3078 @@
+# classify_shower_back.py - 分类展示模块的后端实现，适用于 ROLAND 版本的仓鼠存储管理器。
+import os
+import asyncio
+import datetime
+import json
+import re
+import sqlite3
+import struct
+import subprocess
+from pathlib import Path
+from typing import List, Dict, Optional
+import time
+import uuid
+
+# 导入文件类型列表
+from config.file_type import video_type_list
+
+
+COMMENT_DATABASE_SCHEMA_VERSION = "v1.1"
+REPLY_PAGE_SIZE = 5
+COMMENT_REPLY_CONTROL_FIELDS = (
+    "max_line", "location", "translation_switch", "support_share",
+)
+COMMENT_SOURCE_INFO_EDITABLE_KEYS = {"src-name"}
+COMMENT_ENTITY_JSON_COLUMNS = {
+    "member": {
+        "senior", "level_info", "pendant", "nameplate", "official_verify",
+        "vip", "fans_detail", "user_sailing", "user_sailing_v2",
+        "nft_interaction", "avatar_item",
+    },
+    "content": {
+        "members", "jump_url", "pictures", "emote",
+        "at_name_to_mid", "at_name_to_mid_str",
+    },
+}
+COMMENT_CONFIG_DEFAULTS = {
+    "page-size": 20,
+    "sort-by": "time",
+    "mark-deleted": False,
+    "only-deleted": False,
+    "only-vip": False,
+    "word-filter-enabled": False,
+    "word-count": 0,
+    "word-direction": "above",
+}
+
+
+def _open_comment_database_readonly(database_path):
+    r"""以只查询模式打开本地或 UNC 路径上的 SQLite 评论数据库。
+
+    不能在这里使用 ``Path.as_uri() + '?mode=ro'``：UNC 路径会被转换为
+    ``file://server/share/...``，而 Windows 自带的 SQLite 通常未启用
+    SQLITE_ALLOW_URI_AUTHORITY，会报 ``invalid uri authority``。直接传入原始
+    ``\\server\share\...`` 路径可正常访问，再用 query_only 禁止 SQL 写操作。
+    """
+    database_path = os.fspath(database_path)
+    if not os.path.isfile(database_path):
+        raise FileNotFoundError(f"评论数据库不存在: {database_path}")
+    connection = sqlite3.connect(database_path)
+    connection.execute("PRAGMA query_only=ON")
+    return connection
+
+
+class CommentPageConnectionManager:
+    """只缓存最近一次正常评论页面查询使用的 SQLite 只读连接。"""
+
+    def __init__(self, idle_timeout=60.0):
+        self.idle_timeout = max(0.0, float(idle_timeout))
+        self.database_path = None
+        self.connection = None
+        self.idle_handle = None
+
+    @staticmethod
+    def normalize_path(database_path):
+        return os.path.normcase(os.path.abspath(os.path.normpath(
+            os.fspath(database_path)
+        )))
+
+    def acquire(self, database_path):
+        normalized_path = self.normalize_path(database_path)
+        if self.connection is not None \
+                and normalized_path == self.database_path:
+            self.touch(self.connection)
+            return self.connection
+
+        # 切换评论来源时先释放上一个数据库，再按原有方式检查并打开新库。
+        self.close()
+        connection = _open_comment_database_readonly(normalized_path)
+        self.database_path = normalized_path
+        self.connection = connection
+        self.touch(connection)
+        return connection
+
+    def touch(self, connection):
+        if connection is not self.connection:
+            return
+        if self.idle_handle is not None:
+            self.idle_handle.cancel()
+            self.idle_handle = None
+        if self.idle_timeout <= 0:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self.idle_handle = loop.call_later(self.idle_timeout, self.close)
+
+    def discard(self, connection):
+        """查询异常时仅丢弃发生异常的当前缓存连接。"""
+        if connection is self.connection:
+            self.close()
+
+    def close(self):
+        if self.idle_handle is not None:
+            self.idle_handle.cancel()
+            self.idle_handle = None
+        connection = self.connection
+        self.connection = None
+        self.database_path = None
+        if connection is not None:
+            try:
+                connection.close()
+            except sqlite3.Error as error:
+                print(f"[分类展示模块] 关闭评论页面数据库连接失败: {error}")
+
+
+def _comment_table_columns(connection, table_name):
+    return [
+        row[1]
+        for row in connection.execute(f'PRAGMA table_info("{table_name}")')
+    ]
+
+
+def _decode_comment_entity_value(table_name, column_name, value):
+    """恢复 v1.1 数据库里以 JSON 文本保存的 member/content 结构字段。"""
+    if value is None or column_name not in COMMENT_ENTITY_JSON_COLUMNS[table_name]:
+        return value
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def _decode_comment_reply_control(value):
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            value = {}
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: value[key]
+        for key in COMMENT_REPLY_CONTROL_FIELDS
+        if key in value
+    }
+
+
+def _comment_chunks(values, size=800):
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
+
+
+def _load_comment_entity_rows(connection, table_name, parent_ids):
+    """只加载当前页主评论及其回复引用的 member/content，控制内存占用。"""
+    result = {}
+    parent_ids = sorted(set(parent_ids))
+    for group in _comment_chunks(parent_ids):
+        placeholders = ",".join("?" for _ in group)
+        query = f'SELECT * FROM "{table_name}" WHERE parent IN ({placeholders})'
+        for row in connection.execute(query, group):
+            parent = int(row["parent"])
+            entity = {}
+            for column_name in row.keys():
+                if column_name in {"parent", "_comment_kind", "_data_hash"}:
+                    continue
+                value = row[column_name]
+                if value is None:
+                    continue
+                entity[column_name] = _decode_comment_entity_value(
+                    table_name, column_name, value
+                )
+            result[parent] = entity
+    return result
+
+
+def _comment_rows_to_dicts(rows, members, contents):
+    result = []
+    for row in rows:
+        comment = {}
+        for column_name in row.keys():
+            if column_name.startswith("_") or column_name in {"member", "content"}:
+                continue
+            value = row[column_name]
+            if value is None:
+                continue
+            if column_name == "reply_control":
+                value = _decode_comment_reply_control(value)
+            comment[column_name] = value
+        rpid = int(row["rpid"])
+        comment["member"] = members.get(rpid, {})
+        comment["content"] = contents.get(rpid, {})
+        result.append(comment)
+    return result
+
+
+def _comment_integer_id(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _find_comment_main_rpid(reply, main_ids, replies_by_rpid):
+    root = _comment_integer_id(reply.get("root_str") or reply.get("root"))
+    if root in main_ids:
+        return root
+    current = _comment_integer_id(reply.get("parent_str") or reply.get("parent"))
+    visited = set()
+    while current is not None and current not in visited:
+        if current in main_ids:
+            return current
+        visited.add(current)
+        parent_reply = replies_by_rpid.get(current)
+        if parent_reply is None:
+            break
+        current = _comment_integer_id(
+            parent_reply.get("parent_str") or parent_reply.get("parent")
+        )
+    return None
+
+
+def _select_comment_replies(connection, main_ids):
+    """加载当前页顶层评论关联的全部回复。"""
+    result = {}
+    main_ids = sorted(set(main_ids))
+    reply_columns = set(_comment_table_columns(connection, "reply"))
+    if not main_ids or not {"root", "parent"}.issubset(reply_columns):
+        return []
+    for group in _comment_chunks(main_ids, 400):
+        placeholders = ",".join("?" for _ in group)
+        query = (
+            'SELECT * FROM "reply" '
+            f'WHERE root IN ({placeholders}) OR parent IN ({placeholders})'
+        )
+        for row in connection.execute(query, list(group) + list(group)):
+            result[int(row["rpid"])] = row
+    return sorted(
+        result.values(),
+        key=lambda row: (
+            _comment_integer_id(row["ctime"]) or 0,
+            int(row["rpid"]),
+        ),
+    )
+
+
+def _comment_vip_json(value):
+    if not value:
+        return 0
+    try:
+        value = json.loads(value) if isinstance(value, str) else value
+    except (TypeError, json.JSONDecodeError):
+        return 0
+    return int(isinstance(value, dict) and value.get("vipStatus") == 1)
+
+
+def _build_comment_where(keyword, only_deleted, only_vip,
+                         word_filter_enabled, word_count, word_direction):
+    conditions = []
+    params = []
+    if keyword:
+        escaped = str(keyword).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        conditions.append("COALESCE(content.message, '') LIKE ? ESCAPE '\\'")
+        params.append(f"%{escaped}%")
+    if only_deleted:
+        # 回复被删除时也要保留其顶层评论作为展示上下文，否则这条已删回复
+        # 没有可以挂载的父评论，会在“只显示被删数据”模式下彻底不可见。
+        conditions.append(
+            "(cs_is_deleted(comment.rpid) = 1 OR EXISTS("
+            "SELECT 1 FROM reply AS deleted_reply WHERE "
+            "(deleted_reply.root=comment.rpid OR deleted_reply.parent=comment.rpid) "
+            "AND cs_is_deleted(deleted_reply.rpid)=1))"
+        )
+    if only_vip:
+        conditions.append("cs_is_vip(member.vip) = 1")
+    if word_filter_enabled:
+        comparator = "<=" if word_direction == "below" else ">="
+        conditions.append(f"LENGTH(COALESCE(content.message, '')) {comparator} ?")
+        params.append(max(0, int(word_count)))
+    return (" WHERE " + " AND ".join(conditions) if conditions else ""), params
+
+
+def _select_comment_table_rows(connection, table_name, sort_by, reverse,
+                               offset, limit, where_sql, where_params):
+    if table_name not in {"top", "main"}:
+        raise ValueError("不允许的评论表")
+    sort_column = "like" if sort_by == "like" else "ctime"
+    direction = "DESC" if reverse else "ASC"
+    query = (
+        f'SELECT comment.* FROM "{table_name}" AS comment '
+        'LEFT JOIN content ON content.parent=comment.rpid '
+        'LEFT JOIN member ON member.parent=comment.rpid '
+        f'{where_sql} ORDER BY comment."{sort_column}" {direction}, '
+        f'comment.rpid {direction} LIMIT ? OFFSET ?'
+    )
+    return connection.execute(
+        query, list(where_params) + [limit, offset]
+    ).fetchall()
+
+
+def _count_comment_table_rows(connection, table_name, where_sql, where_params):
+    query = (
+        f'SELECT COUNT(*) FROM "{table_name}" AS comment '
+        'LEFT JOIN content ON content.parent=comment.rpid '
+        'LEFT JOIN member ON member.parent=comment.rpid '
+        f'{where_sql}'
+    )
+    return int(connection.execute(query, where_params).fetchone()[0])
+
+
+def load_comment_page_from_database(database_path, sort_by, page, page_size,
+                                    keyword="", only_deleted=False,
+                                    only_vip=False, word_filter_enabled=False,
+                                    word_count=0, word_direction="above",
+                                    deleted_rpids=None,
+                                    connection_manager=None):
+    """按 top + main 的连续序列筛选并还原一页 v1.1 评论。"""
+    sort_by = sort_by if sort_by in {"like", "time"} else "time"
+    page_size = min(max(int(page_size), 1), 200)
+    requested_page = max(int(page), 1)
+    deleted_rpids = {int(value) for value in (deleted_rpids or [])}
+    database_path = os.path.abspath(os.path.normpath(os.fspath(database_path)))
+    owns_connection = connection_manager is None
+    connection = (
+        _open_comment_database_readonly(database_path)
+        if owns_connection else connection_manager.acquire(database_path)
+    )
+    connection.row_factory = sqlite3.Row
+    connection.create_function(
+        "cs_is_deleted", 1,
+        lambda rpid: int(_comment_integer_id(rpid) in deleted_rpids),
+    )
+    connection.create_function("cs_is_vip", 1, _comment_vip_json)
+    try:
+        tables = {
+            row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        required = {"_metadata", "main", "reply", "member", "content"}
+        missing = required - tables
+        if missing:
+            raise ValueError("数据库缺少表：" + ", ".join(sorted(missing)))
+        metadata = dict(connection.execute(
+            "SELECT metadata_key,metadata_value FROM _metadata"
+        ))
+        if metadata.get("schema_version") != COMMENT_DATABASE_SCHEMA_VERSION:
+            raise ValueError(
+                f"评论数据库版本 {metadata.get('schema_version')!r}，"
+                f"当前只支持 {COMMENT_DATABASE_SCHEMA_VERSION!r}"
+            )
+
+        where_sql, where_params = _build_comment_where(
+            keyword, only_deleted, only_vip, word_filter_enabled,
+            word_count, word_direction,
+        )
+        top_count = (
+            _count_comment_table_rows(connection, "top", where_sql, where_params)
+            if "top" in tables else 0
+        )
+        main_count = _count_comment_table_rows(
+            connection, "main", where_sql, where_params
+        )
+        total_count = top_count + main_count
+        total_pages = max(1, (total_count + page_size - 1) // page_size)
+        selected_page = min(requested_page, total_pages)
+        start = (selected_page - 1) * page_size
+        end = min(start + page_size, total_count)
+
+        top_rows = []
+        if start < top_count:
+            top_limit = max(0, min(end, top_count) - start)
+            if top_limit:
+                top_rows = _select_comment_table_rows(
+                    connection, "top", sort_by, True,
+                    start, top_limit, where_sql, where_params,
+                )
+        main_start = max(start - top_count, 0)
+        main_limit = max(0, end - max(start, top_count))
+        main_rows = []
+        if main_limit:
+            main_rows = _select_comment_table_rows(
+                connection, "main", sort_by, True,
+                main_start, main_limit, where_sql, where_params,
+            )
+
+        parent_ids = [int(row["rpid"]) for row in top_rows + main_rows]
+        reply_rows = _select_comment_replies(connection, parent_ids)
+        all_ids = parent_ids + [int(row["rpid"]) for row in reply_rows]
+        members = _load_comment_entity_rows(connection, "member", all_ids)
+        contents = _load_comment_entity_rows(connection, "content", all_ids)
+        top_comments = _comment_rows_to_dicts(top_rows, members, contents)
+        main_comments = _comment_rows_to_dicts(main_rows, members, contents)
+        replies = _comment_rows_to_dicts(reply_rows, members, contents)
+        if connection_manager is not None:
+            connection_manager.touch(connection)
+    except Exception:
+        if connection_manager is not None:
+            connection_manager.discard(connection)
+        raise
+    finally:
+        if owns_connection:
+            connection.close()
+
+    for comment in top_comments:
+        comment["is_top"] = True
+    top_level = top_comments + main_comments
+    main_by_rpid = {int(item["rpid"]): item for item in top_level}
+    replies_by_rpid = {int(item["rpid"]): item for item in replies}
+    main_ids = set(main_by_rpid)
+    for comment in top_level:
+        comment["replies"] = []
+        comment["_is_deleted"] = int(comment["rpid"]) in deleted_rpids
+    for reply in replies:
+        reply["_is_deleted"] = int(reply["rpid"]) in deleted_rpids
+        owner = _find_comment_main_rpid(reply, main_ids, replies_by_rpid)
+        if owner is not None:
+            main_by_rpid[owner]["replies"].append(reply)
+    return {
+        "comments": top_level,
+        "totalCount": total_count,
+        "page": selected_page,
+        "requestedPage": requested_page,
+        "pageSize": page_size,
+        "totalPages": total_pages,
+    }
+
+
+def _comment_file_uri(root, relative_path):
+    relative_path = str(relative_path or "").replace("\\", "/").lstrip("./")
+    # resource_root 在进入评论渲染链路前已经规范化为绝对路径。这里不能再调用
+    # Path.resolve()：对 UNC 路径而言，每个 src 都会触发一次网络文件系统查询。
+    # 纯字符串规范化即可生成同样的 file URI，且不会访问磁盘或网络共享。
+    absolute_path = os.path.abspath(os.path.normpath(
+        os.path.join(os.fspath(root), relative_path)
+    ))
+    return Path(absolute_path).as_uri()
+
+
+def remap_url_to_absolute(url, resource_root, basic_resource_folder):
+    """把单个评论资源 URL 映射成前端可加载的绝对 file URI。"""
+    if not isinstance(url, str):
+        return url
+    normalized = url.replace("\\", "/")
+    for prefix in ("./comment-resource/", "comment-resource/"):
+        if normalized.startswith(prefix):
+            return _comment_file_uri(
+                Path(resource_root) / 'comment-resource',
+                normalized[len(prefix):],
+            )
+    for prefix in ("./bilibili-resource/", "bilibili-resource/"):
+        if normalized.startswith(prefix):
+            return _comment_file_uri(
+                Path(resource_root) / basic_resource_folder,
+                normalized[len(prefix):],
+            )
+    return url
+
+
+def build_comment_font_style(resource_root, basic_resource_folder):
+    """生成放在 CS_COMMENT_HTML 最前方、路径已重映射的字体声明。"""
+    harmony_font = remap_url_to_absolute(
+        './bilibili-resource/HarmonyOS-Regular-subset1.woff',
+        resource_root, basic_resource_folder,
+    )
+    fans_font = remap_url_to_absolute(
+        './bilibili-resource/fans-num.ttf',
+        resource_root, basic_resource_folder,
+    )
+    return f'''<style>
+        @font-face {{
+            font-family: "HarmonyOS_Regular";
+            src: url("{harmony_font}") format("woff");
+        }}
+        @font-face {{
+            font-family: 'fans-num';
+            src: url("{fans_font}") format("truetype");
+        }}
+    </style>'''
+
+
+def calculate_time_desc(ctime):
+    now = datetime.datetime.now().timestamp()
+    diff = int(now - ctime)
+    if diff < 60:
+        return f"{diff}秒前"
+    elif diff < 3600:
+        return f"{diff // 60}分钟前"
+    elif diff < 86400:
+        return f"{diff // 3600}小时前"
+    else:
+        return f"{diff // 86400}天前发布"
+
+
+css_style_trans_dict = {
+    "borderRadius": "border-radius",
+    "boxSizing": "box-sizing",
+}
+
+def build_avatar_html(avatar_item, base_width, base_height,
+                      resource_root, basic_resource_folder):
+    if not avatar_item:
+        return ""
+    
+    container_size = avatar_item.get("container_size", {})
+    canvas_width = container_size.get("width", 1.8) * base_width
+    canvas_height = container_size.get("height", 1.8) * base_height
+    
+    layers_data = avatar_item.get("layers", [])
+    if not layers_data:
+        fallback_layers = avatar_item.get("fallback_layers", {})
+        layers_data = fallback_layers.get("layers", [])
+    
+    layers_html = parse_layers(
+        layers_data, base_width, base_height,
+        resource_root, basic_resource_folder,
+    )
+    
+    return f'<div class="avatar-canvas" style="width: {int(canvas_width)}px; height: {int(canvas_height)}px;">{layers_html}</div>'
+
+
+def parse_layers(layers_data, base_width, base_height,
+                 resource_root, basic_resource_folder):
+    if not layers_data:
+        return ""
+
+    result = ""
+    # 栈式DFS：("layer", layer_dict) 处理图层，("close", None) 闭合div
+    stack = []
+    for layer in reversed(layers_data):
+        stack.append(("layer", layer))
+
+    while stack:
+        task_type, task_data = stack.pop()
+
+        if task_type == "close":
+            result += '</div>'
+            continue
+
+        layer = task_data
+        visible = layer.get("visible", False)
+
+        general_spec = layer.get("general_spec", {})
+        pos_spec = general_spec.get("pos_spec", {})
+        size_spec = general_spec.get("size_spec", {})
+        render_spec = general_spec.get("render_spec", {})
+
+        coordinate_pos = pos_spec.get("coordinate_pos", 2)
+        axis_x = pos_spec.get("axis_x", 0.9)
+        axis_y = pos_spec.get("axis_y", 0.9)
+        width = size_spec.get("width", 1) * base_width
+        height = size_spec.get("height", 1) * base_height
+        opacity = render_spec.get("opacity", 1)
+
+        if coordinate_pos == 1:
+            x = int(axis_x * base_width)
+            y = int(axis_y * base_height)
+        else:
+            x = int(axis_x * base_width - width / 2)
+            y = int(axis_y * base_height - height / 2)
+
+        if visible:
+            layer_style = f"left: {x}px; top: {y}px; width: {int(width)}px; height: {int(height)}px;"
+        else:
+            layer_style = ""
+        if opacity != 1:
+            layer_style += f" opacity: {opacity};"
+
+        img_html = ""
+        if visible:
+            resource = layer.get("resource", {})
+            res_type = resource.get("res_type", 0)
+
+            if res_type == 4:
+                res_animation = resource.get("res_animation", {})
+                webp_src = res_animation.get("webp_src", {})
+                remote = webp_src.get("remote", {})
+                img_url = remote.get("url", "")
+            elif res_type == 3:
+                res_image = resource.get("res_image", {})
+                image_src = res_image.get("image_src", {})
+                src_type = image_src.get("src_type", 1)
+                if src_type == 2:
+                    local_id = image_src.get("local", 0)
+                    img_url = f"./bilibili-resource/res-local{local_id}.png"
+                else:
+                    remote = image_src.get("remote", {})
+                    img_url = remote.get("url", "")
+            else:
+                img_url = ""
+
+            if img_url:
+                img_url = remap_url_to_absolute(
+                    img_url, resource_root, basic_resource_folder
+                )
+                layer_config = layer.get("layer_config", {})
+                tags = layer_config.get("tags", {})
+                general_cfg = tags.get("GENERAL_CFG", {})
+                general_config = general_cfg.get("general_config", {})
+                web_css_style = general_config.get("web_css_style", {})
+
+                img_style_parts = [f"width: {int(width)}px; height: {int(height)}px;"]
+                for key, value in web_css_style.items():
+                    css_key = css_style_trans_dict.get(key, key)
+                    img_style_parts.append(f"{css_key}: {value};")
+                img_style = "; ".join(img_style_parts)
+
+                img_html = f'<img src="{img_url}" style="{img_style}">'
+
+        sub_layers = layer.get("layers", [])
+        if sub_layers:
+            # 先压入闭合任务（最后执行），再压入子图层（逆序保证顺序一致）
+            stack.append(("close", None))
+            for sub_layer in reversed(sub_layers):
+                stack.append(("layer", sub_layer))
+            result += f'<div class="avatar-layer" style="{layer_style}">{img_html}'
+        else:
+            result += f'<div class="avatar-layer" style="{layer_style}">{img_html}</div>'
+
+    return result
+
+
+def comment_to_comment_html(comment, resource_root, basic_resource_folder,
+                            mark_deleted=False):
+    '''
+    将一条评论转换为对应的HTML字符串
+    '''
+    comment_id = comment.get("rpid", 0)
+    deleted_comment_class = (
+        " cs-cmt-v1-deleted-data"
+        if mark_deleted and comment.get("_is_deleted") else ""
+    )
+    member = comment.get("member", {})
+    content = comment.get("content", {})
+    reply_control = comment.get("reply_control", {})
+    replies = comment.get("replies", []) or []
+
+    username = member.get("uname", "匿名用户")
+    level = member.get("level_info", {}).get("current_level", 0)
+    vip_status = member.get("vip", {}).get("vipStatus", 0)
+    is_senior_member = member.get("is_senior_member", 0)
+    avatar_item = member.get("avatar_item", {})
+
+    is_vip = vip_status == 1
+    username_class = (
+        "cs-cmt-v1-username cs-cmt-v1-vip-username"
+        if is_vip else "cs-cmt-v1-username"
+    )
+    avatar_html = build_avatar_html(
+        avatar_item, 48, 48, resource_root, basic_resource_folder
+    )
+
+    level_svg = "level_h.svg" if (level == 6 and is_senior_member == 1) else f"level_{level}.svg"
+    level_src = remap_url_to_absolute(
+        f'./bilibili-resource/{level_svg}',
+        resource_root, basic_resource_folder,
+    )
+    like_icon_src = remap_url_to_absolute(
+        './bilibili-resource/like.svg',
+        resource_root, basic_resource_folder,
+    )
+    dislike_icon_src = remap_url_to_absolute(
+        './bilibili-resource/dislike.svg',
+        resource_root, basic_resource_folder,
+    )
+
+    message = content.get("message", "")
+    emotes = content.get("emote", {}) or {}
+    jump_url = content.get("jump_url", {}) or {}
+    pictures = content.get("pictures", []) or []
+
+    message_html = message
+    for emote_key, emote_data in emotes.items():
+        emote_url = remap_url_to_absolute(
+            emote_data.get("url", ""),
+            resource_root, basic_resource_folder,
+        )
+        emote_meta = emote_data.get("meta", {}) or {}
+        emote_size = emote_meta.get("size", 1)
+        if emote_url:
+            if emote_size == 1:
+                message_html = message_html.replace(
+                    emote_key,
+                    f'<img src="{emote_url}" alt="{emote_key}" title="{emote_data.get("text", "")}">'
+                )
+            else:
+                max_width = 25*int(emote_size)
+                max_height = max_width
+                message_html = message_html.replace(
+                    emote_key,
+                    f'<img src="{emote_url}" alt="{emote_key}" title="{emote_data.get("text", "")}" style="max-width: {max_width}px; max-height: {max_height}px;">'
+                )
+
+    for url, url_data in jump_url.items():
+        prefix_icon = remap_url_to_absolute(
+            url_data.get("prefix_icon", ""),
+            resource_root, basic_resource_folder,
+        )
+        title = url_data.get("title", "")
+        pc_url = url_data.get("pc_url", "")
+        icon_position = url_data.get("icon_position", 0)
+        if pc_url.startswith("//"):
+            pc_url = "https:" + pc_url
+        if pc_url:
+            if prefix_icon and title and icon_position == 0:
+                jump_html = f'<a href="{pc_url}" class="cs-cmt-v1-jump-link" target="_blank"><img src="{prefix_icon}" alt="链接" width="18" height="18">{title}</a>'
+                message_html = message_html.replace(url, jump_html)
+            elif prefix_icon and title and icon_position == 1:
+                jump_html = f'<a href="{pc_url}" class="cs-cmt-v1-jump-link" target="_blank">{title}<img src="{prefix_icon}" alt="链接" style="max-width: 18px; max-height: 18px; margin: 0px;"></a>'
+                message_html = message_html.replace(url, jump_html)
+        else:
+            if prefix_icon and title and icon_position == 0:
+                jump_html = f'<a href="{url}" class="cs-cmt-v1-jump-link" target="_blank"><img src="{prefix_icon}" alt="链接" width="18" height="18">{title}</a>'
+                message_html = message_html.replace(url, jump_html)
+            elif prefix_icon and title and icon_position == 1:
+                jump_html = f'<a href="{url}" class="cs-cmt-v1-jump-link" target="_blank">{title}<img src="{prefix_icon}" alt="链接" style="max-width: 18px; max-height: 18px; margin: 0px;"></a>'
+                message_html = message_html.replace(url, jump_html)
+
+    pictures_html = ""
+    all_srcs = [
+        remap_url_to_absolute(
+            pic.get("img_src", ""), resource_root, basic_resource_folder
+        )
+        for pic in pictures if pic.get("img_src")
+    ]
+    if len(all_srcs) == 1:
+        img_src = all_srcs[0]
+        pictures_html = f'\n            <div class="cs-cmt-v1-comment-picture cs-cmt-v1-single"><img src="{img_src}" alt="评论图片" data-cs-cmt-preview></div>'
+    elif len(all_srcs) > 1:
+        pictures_html = '\n            <div class="cs-cmt-v1-comment-picture cs-cmt-v1-grid">'
+        for i, img_src in enumerate(all_srcs):
+            pictures_html += f'\n                <div class="cs-cmt-v1-picture-item" data-cs-cmt-preview><img src="{img_src}" alt="评论图片"></div>'
+        pictures_html += '\n            </div>'
+
+    like_count = comment.get("like", 0)
+    like_count_html = f'<span>{like_count}</span>' if like_count > 0 else ''
+    location = reply_control.get("location", "")
+    ctime = comment.get("ctime", 0)
+    time_desc = calculate_time_desc(ctime)
+    timestamp = datetime.datetime.fromtimestamp(ctime).strftime("%Y-%m-%d %H:%M:%S")
+
+    cardbg_html = ""
+    user_sailing = member.get("user_sailing", {})
+    if user_sailing and "cardbg" in user_sailing:
+        cardbg = user_sailing["cardbg"]
+        if cardbg:
+            cardbg_image = remap_url_to_absolute(
+                cardbg.get("image", ""),
+                resource_root, basic_resource_folder,
+            )
+            cardbg_jump_url = cardbg.get("jump_url", "")
+            cardbg_name = cardbg.get("name", "")
+            cardbg_id = cardbg.get("id", "")
+            fan = cardbg.get("fan", {})
+            num_prefix = fan.get("num_prefix", "")
+            num_desc = fan.get("num_desc", "")
+            color_format = fan.get("color_format", {})
+            if type(color_format) != dict:
+                color_format = {}
+            colors = color_format.get("colors", ["#B8C7D0FF", "#A2A7B0FF"])
+            gradients = color_format.get("gradients", [0, 100])
+            gradient_parts = []
+            for i, color in enumerate(colors):
+                color_hex = color.replace("FF", "") if color.endswith("FF") else color
+                percent = gradients[i] if i < len(gradients) else (100 if i == len(colors) - 1 else 0)
+                gradient_parts.append(f"{color_hex} {percent}%")
+            gradient_style = f"background-image: linear-gradient(135deg, {', '.join(gradient_parts)}); -webkit-text-fill-color: transparent; background-clip: text;"
+            cardbg_html = f"""
+            <a href="{cardbg_jump_url}" class="cs-cmt-v1-cardBg" target="_blank">
+                <img src="{cardbg_image}" alt="{cardbg_name}">
+                <div class="cs-cmt-v1-card-text" style="{gradient_style}">
+                    <span>{num_prefix}</span>
+                    <span>{num_desc}</span>
+                </div>
+                <div class="cs-cmt-v1-tooltip">
+                    <div class="cs-cmt-v1-tooltip-name">{cardbg_name}</div>
+                    <div class="cs-cmt-v1-tooltip-id">ID: {cardbg_id}</div>
+                </div>
+            </a>"""
+
+    mid = member.get("mid", "")
+    profile_url = f"https://space.bilibili.com/{mid}" if mid else ""
+
+    comment_html = f"""
+        <div class="cs-cmt-v1-comment-item{deleted_comment_class}">
+            {cardbg_html}
+            <div class="cs-cmt-v1-comment-header">
+                <a href="{profile_url}" class="cs-cmt-v1-avatar" target="_blank">
+                    {avatar_html}
+                </a>
+                <div class="cs-cmt-v1-user-info">
+                    <div class="{username_class}">
+                        {username}
+                        <img class="cs-cmt-v1-level-badge" src="{level_src}" alt="Lv.{level}">
+                    </div>
+                    <div class="cs-cmt-v1-meta-info">
+                        <span>{time_desc}</span>
+                        {f'<span>{location}</span>' if location else ''}
+                    </div>
+                </div>
+            </div>
+            <div class="cs-cmt-v1-comment-content">{message_html}</div>{pictures_html}
+            <div class="cs-cmt-v1-comment-footer">
+                <span class="cs-cmt-v1-timestamp">{timestamp}</span>
+                <div class="cs-cmt-v1-action-btn">
+                    <img src="{like_icon_src}" alt="赞" width="16" height="16">
+                    {like_count_html}
+                </div>
+                <div class="cs-cmt-v1-action-btn">
+                    <img src="{dislike_icon_src}" alt="踩" width="16" height="16">
+                </div>
+            </div>"""
+
+    if replies:
+        total_replies = len(replies)
+        comment_html += f"""
+            <div class="cs-cmt-v1-reply-section">
+                <div class="cs-cmt-v1-reply-container" id="cs-cmt-v1-reply-container-{comment_id}">"""
+        
+        for idx, reply in enumerate(replies):
+            reply_member = reply.get("member", {})
+            reply_content = reply.get("content", {})
+            reply_reply_control = reply.get("reply_control", {})
+
+            reply_username = reply_member.get("uname", "匿名用户")
+            reply_level = reply_member.get("level_info", {}).get("current_level", 0)
+            reply_vip_status = reply_member.get("vip", {}).get("vipStatus", 0)
+            reply_is_senior_member = reply_member.get("is_senior_member", 0)
+            reply_avatar_item = reply_member.get("avatar_item", {})
+
+            reply_is_vip = reply_vip_status == 1
+            reply_username_class = (
+                "cs-cmt-v1-reply-username cs-cmt-v1-vip-username"
+                if reply_is_vip else "cs-cmt-v1-reply-username"
+            )
+            reply_avatar_html = build_avatar_html(
+                reply_avatar_item, 36, 36,
+                resource_root, basic_resource_folder,
+            )
+
+            reply_level_svg = "level_h.svg" if (reply_level == 6 and reply_is_senior_member == 1) else f"level_{reply_level}.svg"
+            reply_level_src = remap_url_to_absolute(
+                f'./bilibili-resource/{reply_level_svg}',
+                resource_root, basic_resource_folder,
+            )
+
+            reply_message = reply_content.get("message", "")
+            reply_emotes = reply_content.get("emote", {}) or {}
+            reply_jump_url = reply_content.get("jump_url", {}) or {}
+            reply_pictures = reply_content.get("pictures", []) or []
+
+            reply_message_html = reply_message
+            for emote_key, emote_data in reply_emotes.items():
+                emote_url = remap_url_to_absolute(
+                    emote_data.get("url", ""),
+                    resource_root, basic_resource_folder,
+                )
+                emote_meta = emote_data.get("meta", {}) or {}
+                emote_size = emote_meta.get("size", 1)
+                if emote_url:
+                    if emote_size == 1:
+                        reply_message_html = reply_message_html.replace(
+                            emote_key,
+                            f'<img src="{emote_url}" alt="{emote_key}" title="{emote_data.get("text", "")}">'
+                        )
+                    else:
+                        max_width = 25*int(emote_size)
+                        max_height = max_width
+                        reply_message_html = reply_message_html.replace(
+                            emote_key,
+                            f'<img src="{emote_url}" alt="{emote_key}" title="{emote_data.get("text", "")}" style="max-width: {max_width}px; max-height: {max_height}px;">'
+                        )
+
+            for url, url_data in reply_jump_url.items():
+                prefix_icon = remap_url_to_absolute(
+                    url_data.get("prefix_icon", ""),
+                    resource_root, basic_resource_folder,
+                )
+                title = url_data.get("title", "")
+                pc_url = url_data.get("pc_url", "")
+                icon_position = url_data.get("icon_position", 0)
+                if pc_url.startswith("//"):
+                    pc_url = "https:" + pc_url
+                if pc_url:
+                    if prefix_icon and title and icon_position == 0:
+                        jump_html = f'<a href="{pc_url}" class="cs-cmt-v1-jump-link" target="_blank"><img src="{prefix_icon}" alt="链接" width="18" height="18">{title}</a>'
+                        reply_message_html = reply_message_html.replace(url, jump_html)
+                    elif prefix_icon and title and icon_position == 1:
+                        jump_html = f'<a href="{pc_url}" class="cs-cmt-v1-jump-link" target="_blank">{title}<img src="{prefix_icon}" alt="链接" style="max-width: 18px; max-height: 18px; margin: 0px;"></a>'
+                        reply_message_html = reply_message_html.replace(url, jump_html)
+                else:
+                    if prefix_icon and title and icon_position == 0:
+                        jump_html = f'<a href="{url}" class="cs-cmt-v1-jump-link" target="_blank"><img src="{prefix_icon}" alt="链接" width="18" height="18">{title}</a>'
+                        reply_message_html = reply_message_html.replace(url, jump_html)
+                    elif prefix_icon and title and icon_position == 1:
+                        jump_html = f'<a href="{url}" class="cs-cmt-v1-jump-link" target="_blank">{title}<img src="{prefix_icon}" alt="链接" style="max-width: 18px; max-height: 18px; margin: 0px;"></a>'
+                        reply_message_html = reply_message_html.replace(url, jump_html)
+
+            reply_pictures_html = ""
+            reply_all_srcs = [
+                remap_url_to_absolute(
+                    pic.get("img_src", ""), resource_root,
+                    basic_resource_folder,
+                )
+                for pic in reply_pictures if pic.get("img_src")
+            ]
+            if len(reply_all_srcs) == 1:
+                img_src = reply_all_srcs[0]
+                reply_pictures_html = f'\n                        <div class="cs-cmt-v1-comment-picture cs-cmt-v1-single"><img src="{img_src}" alt="评论图片" data-cs-cmt-preview></div>'
+            elif len(reply_all_srcs) > 1:
+                reply_pictures_html = '\n                        <div class="cs-cmt-v1-comment-picture cs-cmt-v1-grid">'
+                for i, img_src in enumerate(reply_all_srcs):
+                    reply_pictures_html += f'\n                            <div class="cs-cmt-v1-picture-item" data-cs-cmt-preview><img src="{img_src}" alt="评论图片"></div>'
+                reply_pictures_html += '\n                        </div>'
+
+            reply_like = reply.get("like", 0)
+            reply_like_html = f'<span>{reply_like}</span>' if reply_like > 0 else ''
+            reply_location = reply_reply_control.get("location", "")
+            reply_ctime = reply.get("ctime", 0)
+            reply_time = calculate_time_desc(reply_ctime)
+            reply_timestamp = datetime.datetime.fromtimestamp(reply_ctime).strftime("%Y-%m-%d %H:%M:%S")
+            reply_mid = reply_member.get("mid", "")
+            reply_profile_url = f"https://space.bilibili.com/{reply_mid}" if reply_mid else ""
+            deleted_reply_class = (
+                " cs-cmt-v1-deleted-data"
+                if mark_deleted and reply.get("_is_deleted") else ""
+            )
+
+            display_style = ' style="display: none;"' if total_replies > 2 and idx >= 2 else ''
+
+            comment_html += f"""
+                    <div class="cs-cmt-v1-reply-item{deleted_reply_class}" data-reply-index="{idx}"{display_style}>
+                        <div class="cs-cmt-v1-reply-header">
+                            <a href="{reply_profile_url}" class="cs-cmt-v1-reply-avatar" target="_blank">
+                                {reply_avatar_html}
+                            </a>
+                            <div>
+                                <div class="{reply_username_class}">
+                                    {reply_username}
+                                    <img class="cs-cmt-v1-level-badge" src="{reply_level_src}" alt="Lv.{reply_level}">
+                                </div>
+                                <div class="cs-cmt-v1-reply-meta">
+                                    {reply_time}
+                                    {f' · {reply_location}' if reply_location else ''}
+                                </div>
+                            </div>
+                        </div>
+                        <div class="cs-cmt-v1-reply-content">{reply_message_html}</div>{reply_pictures_html}
+                        <div class="cs-cmt-v1-reply-footer">
+                            <span class="cs-cmt-v1-timestamp">{reply_timestamp}</span>
+                            <div class="cs-cmt-v1-action-btn">
+                                <img src="{like_icon_src}" alt="赞" width="16" height="16">
+                                {reply_like_html}
+                            </div>
+                            <div class="cs-cmt-v1-action-btn">
+                                <img src="{dislike_icon_src}" alt="踩" width="16" height="16">
+                            </div>
+                        </div>
+                    </div>"""
+        
+        comment_html += """
+                </div>"""
+        
+        if total_replies > 2:
+            expand_display = ''
+            if total_replies <= REPLY_PAGE_SIZE:
+                pagination_display = ' style="display: none;"'
+                pagination_html = ''
+            else:
+                pagination_display = ' style="display: none;"'
+                total_pages = (total_replies + REPLY_PAGE_SIZE - 1) // REPLY_PAGE_SIZE
+                pagination_html = f'<span class="cs-cmt-v1-page-count">共{total_pages}页</span><span class="cs-cmt-v1-page-num cs-cmt-v1-active">1</span>'
+                if total_pages > 1:
+                    pagination_html += f'<span class="cs-cmt-v1-page-btn" data-cs-cmt-action="reply-page" data-comment-id="{comment_id}" data-page="2" data-total-count="{total_replies}">下一页</span>'
+                pagination_html += f'<span class="cs-cmt-v1-page-btn" data-cs-cmt-action="toggle-replies" data-comment-id="{comment_id}" data-total-count="{total_replies}">收起</span>'
+            
+            comment_html += f"""
+                <div class="cs-cmt-v1-reply-expand-btn"{expand_display} data-cs-cmt-action="toggle-replies" data-comment-id="{comment_id}" data-total-count="{total_replies}">共{total_replies}条回复，点击查看</div>"""
+            
+            if total_replies > REPLY_PAGE_SIZE:
+                comment_html += f"""
+                <div class="cs-cmt-v1-reply-pagination" id="cs-cmt-v1-reply-pagination-{comment_id}"{pagination_display}>
+                    {pagination_html}
+                </div>"""
+        
+        comment_html += """
+            </div>"""
+
+    comment_html += """
+        </div>"""
+    return comment_html
+
+class ClassifyShowerModule:
+    VIDEO_STREAM_HIGH_WATER_SECONDS = 30.0
+    # 这里只允许能直接封装进 fMP4、且主流 Chromium MSE 有解码能力的视频编码。
+    # MPEG-4 Part 2（DivX/Xvid）虽然能放进 MP4，但浏览器通常无法解码，不能流复制。
+    VIDEO_CODEC_MIME_MAP = {
+        'h264': 'avc1.640028',
+        'hevc': 'hvc1.1.6.L120.B0',
+        'av1': 'av01.0.08M.08',
+        'vp9': 'vp09.00.10.08'
+    }
+    SUPPORTED_VIDEO_CODECS = frozenset(VIDEO_CODEC_MIME_MAP)
+    # AAC 是当前 fMP4/MSE 传输链路唯一保证跨浏览器可用的音频输出格式。
+    SUPPORTED_AUDIO_CODECS = frozenset({'aac'})
+
+    def __init__(self, global_config):
+        # 初始化模块配置
+        self.global_config = global_config
+        # 获取脚本所在目录的绝对路径
+        self.script_dir = os.path.dirname(os.path.abspath(__file__))
+        # 配置文件路径
+        self.config_path = os.path.join(self.script_dir, 'config', 'classify_shower_config.json')
+        self.config = {}
+        # 每个 WebSocket、每个播放器组件至多保留一个 FFmpeg 流任务。
+        self.video_streams = {}
+        # 正常评论页面查询复用最近一个数据库连接；切换来源或闲置后自动关闭。
+        self.comment_page_connection_manager = CommentPageConnectionManager(
+            idle_timeout=1800.0
+        )
+        self.module_dir = os.path.join(self.script_dir, 'classify_shower')
+        # 数据库路径
+        self.db_path = os.path.join(self.module_dir, 'classify_shower.db')
+        # 拼音字典
+        self.pinyin_dict = {}
+        # 加载拼音字典
+        self.load_pinyin_dict()
+        # 加载配置
+        self.load_config()
+        # 初始化数据库
+        self.init_database()
+        print("[分类展示模块] 模块初始化完成")
+
+    def load_pinyin_dict(self):
+        """
+        从 pinyin.txt 文件加载拼音字典（不保留声调，只取第一个拼音）
+        """
+        pinyin_file_path = os.path.join(self.module_dir, 'pinyin.txt')
+        tone_map = {
+            'ā': 'a', 'á': 'a', 'ǎ': 'a', 'à': 'a',
+            'ē': 'e', 'é': 'e', 'ě': 'e', 'è': 'e',
+            'ī': 'i', 'í': 'i', 'ǐ': 'i', 'ì': 'i',
+            'ō': 'o', 'ó': 'o', 'ǒ': 'o', 'ò': 'o',
+            'ū': 'u', 'ú': 'u', 'ǔ': 'u', 'ù': 'u',
+            'ǖ': 'v', 'ǘ': 'v', 'ǚ': 'v', 'ǜ': 'v',
+            'ü': 'v'
+        }
+        
+        try:
+            with open(pinyin_file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            for line in content.split('\n'):
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                
+                if ':' not in line:
+                    continue
+                code_part, pinyin_part = line.split(':', 1)
+                unicode_hex = code_part.strip()[2:]
+                try:
+                    hanzi = chr(int(unicode_hex, 16))
+                except (ValueError, OverflowError):
+                    continue
+                # 只取第一个拼音
+                first_pinyin = pinyin_part.strip().split(',')[0].strip()
+                # 去掉声调
+                pinyin = ''.join(tone_map.get(ch, ch) for ch in first_pinyin)
+                self.pinyin_dict[hanzi] = pinyin
+            
+            print(f"[分类展示模块] 拼音字典加载成功，共 {len(self.pinyin_dict)} 个汉字")
+        except Exception as e:
+            print(f"[分类展示模块] 拼音字典加载失败: {e}")
+        
+    def load_config(self):
+        """加载分类展示模块配置"""
+        if os.path.exists(self.config_path) and os.path.isfile(self.config_path):
+            try:
+                with open(self.config_path, 'r', encoding='utf-8') as f:
+                    self.config = json.load(f)
+                    print(f"[分类展示模块] 配置加载成功")
+            except Exception as e:
+                print(f"[分类展示模块] 配置加载失败: {e}")
+        else:
+            print(f"[分类展示模块] 配置文件不存在，将使用默认配置")
+    
+    def save_config(self):
+        """保存分类展示模块配置"""
+        # 确保config目录存在
+        config_dir = os.path.join(self.script_dir, 'config')
+        if not os.path.exists(config_dir):
+            os.makedirs(config_dir)
+        
+        try:
+            with open(self.config_path, 'w', encoding='utf-8') as f:
+                json.dump(self.config, f, indent=2, ensure_ascii=False)
+            print(f"[分类展示模块] 配置保存成功")
+        except Exception as e:
+            print(f"[分类展示模块] 配置保存失败: {e}")
+
+    @staticmethod
+    def is_path_within(base_path: str, target_path: str) -> bool:
+        """判断目标是否位于根目录内；不同盘符或不同 UNC 共享直接视为不匹配。"""
+        try:
+            normalized_base = os.path.normcase(os.path.realpath(os.path.abspath(base_path)))
+            normalized_target = os.path.normcase(os.path.realpath(os.path.abspath(target_path)))
+            return os.path.commonpath([normalized_base, normalized_target]) == normalized_base
+        except ValueError:
+            # Windows 在比较不同盘符，或本地路径与 UNC 路径时会抛出 ValueError。
+            return False
+
+    def resolve_video_path(self, root_path: str, video_path: str) -> str:
+        """解析并校验前端提交的视频路径，禁止越出已配置的资源目录。"""
+        if not root_path or not video_path:
+            raise ValueError("缺少视频路径")
+
+        root_path = os.path.realpath(os.path.abspath(root_path))
+        full_path = os.path.realpath(os.path.abspath(os.path.join(root_path, video_path)))
+        if not self.is_path_within(root_path, full_path):
+            raise ValueError("视频路径超出番剧目录")
+
+        allowed_roots = [
+            os.path.realpath(os.path.abspath(path))
+            for path in self.global_config.get('base_dir', [])
+        ]
+        if allowed_roots and not any(self.is_path_within(path, full_path) for path in allowed_roots):
+            raise ValueError("视频路径不在已配置的资源目录中")
+        if not os.path.isfile(full_path):
+            raise FileNotFoundError(f"视频文件不存在: {full_path}")
+        return full_path
+
+    def get_ffmpeg_path(self) -> str:
+        ffmpeg_path = self.config.get('video-config', {}).get('ffmpeg-path', '')
+        if not ffmpeg_path:
+            raise FileNotFoundError("未在 classify_shower_config.json 中配置 video-config.ffmpeg-path")
+        ffmpeg_path = os.path.expandvars(os.path.expanduser(ffmpeg_path))
+        if not os.path.isfile(ffmpeg_path):
+            raise FileNotFoundError(f"FFmpeg 不存在: {ffmpeg_path}")
+        return ffmpeg_path
+
+    def probe_h264_codec_string(self, ffmpeg_path: str, video_path: str) -> Optional[str]:
+        """从 FFmpeg 生成的 avcC 中提取准确的 RFC 6381 H.264 codec 字符串。"""
+        try:
+            result = subprocess.run([
+                ffmpeg_path, '-hide_banner', '-loglevel', 'error',
+                '-i', video_path, '-map', '0:v:0', '-an', '-c', 'copy',
+                '-frames:v', '1',
+                '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+                '-f', 'mp4', 'pipe:1'
+            ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=15,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+            marker = result.stdout.find(b'avcC')
+            # avcC: configurationVersion, AVCProfileIndication,
+            # profile_compatibility, AVCLevelIndication
+            if marker >= 0 and len(result.stdout) >= marker + 8:
+                return 'avc1.' + result.stdout[marker + 5:marker + 8].hex().upper()
+        except Exception as e:
+            print(f"[分类展示模块] 提取 H.264 codec 信息失败: {e}")
+        return None
+
+    def align_seek_to_video_keyframe(self, ffmpeg_path: str, video_path: str,
+                                     requested_time: float) -> float:
+        """把流复制 Seek 对齐到下一个视频关键帧，避免音频和视频从不同时间起步。"""
+        if requested_time <= 0:
+            return 0.0
+        try:
+            result = subprocess.run([
+                ffmpeg_path, '-hide_banner', '-loglevel', 'info', '-debug_ts',
+                '-ss', f'{requested_time:.6f}', '-i', video_path,
+                '-map', '0:v:0', '-an', '-c', 'copy', '-frames:v', '1',
+                '-f', 'null', 'pipe:1'
+            ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE, timeout=15,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+            output = result.stderr.decode('utf-8', errors='replace')
+            match = re.search(
+                r'muxer <- type:video .*?pkt_pts_time:'
+                r'(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)',
+                output, flags=re.IGNORECASE
+            )
+            if not match:
+                return requested_time
+
+            keyframe_delay = float(match.group(1))
+            if keyframe_delay <= 0.05 or keyframe_delay > 30:
+                return requested_time
+            return requested_time + keyframe_delay
+        except Exception as e:
+            print(f"[分类展示模块] Seek 关键帧探测失败，使用原时间: {e}")
+            return requested_time
+
+    def probe_video(self, ffmpeg_path: str, video_path: str) -> Dict:
+        """利用 FFmpeg 的快速输入探测获取时长和 MSE 所需的 codec MIME。"""
+        result = subprocess.run(
+            [ffmpeg_path, '-hide_banner', '-i', video_path],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        )
+        output = result.stderr.decode('utf-8', errors='replace')
+        duration_match = re.search(r'Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)', output)
+        duration = 0.0
+        if duration_match:
+            duration = (int(duration_match.group(1)) * 3600
+                        + int(duration_match.group(2)) * 60
+                        + float(duration_match.group(3)))
+
+        video_match = re.search(r'Video:\s*([^,\s]+)', output)
+        audio_match = re.search(r'Audio:\s*([^,\s]+)', output)
+        if not video_match:
+            raise ValueError("FFmpeg 未探测到视频轨道")
+
+        video_codec = video_match.group(1).lower()
+        video_supported = video_codec in self.SUPPORTED_VIDEO_CODECS
+        source_audio_codec = audio_match.group(1).lower() if audio_match else None
+        audio_transcoded = bool(
+            source_audio_codec and source_audio_codec not in self.SUPPORTED_AUDIO_CODECS
+        )
+        output_audio_codec = 'aac' if audio_transcoded else source_audio_codec
+        if video_codec == 'h264':
+            detected_video_codec = self.probe_h264_codec_string(ffmpeg_path, video_path)
+        else:
+            detected_video_codec = None
+        codecs = [detected_video_codec or self.VIDEO_CODEC_MIME_MAP.get(video_codec, video_codec)]
+        if output_audio_codec:
+            codecs.append('mp4a.40.2')
+        return {
+            'duration': duration,
+            'videoCodec': video_codec,
+            'videoSupported': video_supported,
+            'sourceAudioCodec': source_audio_codec,
+            'audioCodec': output_audio_codec,
+            'audioTranscoded': audio_transcoded,
+            'mimeType': 'video/mp4; codecs="{}"'.format(','.join(codecs))
+        }
+
+    async def send_stream_json(self, websocket, command: str, **data):
+        await websocket.send(json.dumps({'command': command, **data}, ensure_ascii=False))
+
+    def pack_video_chunk(self, stream_id: str, widget_id: str, sequence: int,
+                         payload: bytes, segment_type: str) -> bytes:
+        header = json.dumps({
+            'type': 'VIDEO_STREAM_CHUNK',
+            'streamId': stream_id,
+            'widgetId': widget_id,
+            'sequence': sequence,
+            'segmentType': segment_type
+        }, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+        return b'HSV1' + struct.pack('>I', len(header)) + header + payload
+
+    @staticmethod
+    def extract_mp4_boxes(buffer: bytearray, end_of_stream: bool = False):
+        """从 FFmpeg 管道数据中取出完整的顶层 ISO-BMFF box。"""
+        boxes = []
+        while len(buffer) >= 8:
+            box_size = int.from_bytes(buffer[0:4], byteorder='big')
+            header_size = 8
+            if box_size == 1:
+                if len(buffer) < 16:
+                    break
+                box_size = int.from_bytes(buffer[8:16], byteorder='big')
+                header_size = 16
+            elif box_size == 0:
+                if not end_of_stream:
+                    break
+                box_size = len(buffer)
+
+            if box_size < header_size:
+                raise ValueError('FFmpeg 输出了无效的 MP4 box 长度')
+            # 防止损坏的长度字段让服务端无限缓存；正常的两秒分片远小于此值。
+            if box_size > 128 * 1024 * 1024:
+                raise ValueError('FFmpeg 输出的单个 MP4 box 超过 128 MB')
+            if len(buffer) < box_size:
+                break
+
+            box_type = bytes(buffer[4:8])
+            boxes.append((box_type, bytes(buffer[:box_size])))
+            del buffer[:box_size]
+        return boxes
+
+    @staticmethod
+    def list_mp4_boxes(data: bytes, start: int = 0, end: Optional[int] = None):
+        """列出一段完整 ISO-BMFF 数据中的直属子 box。"""
+        boxes = []
+        end = len(data) if end is None else min(end, len(data))
+        offset = start
+        while offset + 8 <= end:
+            box_size = int.from_bytes(data[offset:offset + 4], byteorder='big')
+            header_size = 8
+            if box_size == 1:
+                if offset + 16 > end:
+                    break
+                box_size = int.from_bytes(data[offset + 8:offset + 16], byteorder='big')
+                header_size = 16
+            elif box_size == 0:
+                box_size = end - offset
+            if box_size < header_size or offset + box_size > end:
+                break
+            boxes.append((offset, box_size, bytes(data[offset + 4:offset + 8]), header_size))
+            offset += box_size
+        return boxes
+
+    @classmethod
+    def read_mp4_track_timescales(cls, init_segment: bytes) -> Dict[int, int]:
+        """从 moov 的 tkhd/mdhd 建立 track id 到 timescale 的映射。"""
+        timescales = {}
+        for moov_offset, moov_size, box_type, moov_header in cls.list_mp4_boxes(init_segment):
+            if box_type != b'moov':
+                continue
+            moov_end = moov_offset + moov_size
+            for trak_offset, trak_size, trak_type, trak_header in cls.list_mp4_boxes(
+                    init_segment, moov_offset + moov_header, moov_end):
+                if trak_type != b'trak':
+                    continue
+                track_id = None
+                timescale = None
+                trak_end = trak_offset + trak_size
+                for child_offset, child_size, child_type, child_header in cls.list_mp4_boxes(
+                        init_segment, trak_offset + trak_header, trak_end):
+                    content_offset = child_offset + child_header
+                    if child_type == b'tkhd' and content_offset + 24 <= len(init_segment):
+                        version = init_segment[content_offset]
+                        track_id_offset = content_offset + 4 + (16 if version == 1 else 8)
+                        track_id = int.from_bytes(
+                            init_segment[track_id_offset:track_id_offset + 4], byteorder='big'
+                        )
+                    elif child_type == b'mdia':
+                        child_end = child_offset + child_size
+                        for mdia_offset, mdia_size, mdia_type, mdia_header in cls.list_mp4_boxes(
+                                init_segment, content_offset, child_end):
+                            if mdia_type != b'mdhd':
+                                continue
+                            mdhd_content = mdia_offset + mdia_header
+                            if mdhd_content + 24 > len(init_segment):
+                                continue
+                            version = init_segment[mdhd_content]
+                            timescale_offset = mdhd_content + 4 + (16 if version == 1 else 8)
+                            timescale = int.from_bytes(
+                                init_segment[timescale_offset:timescale_offset + 4],
+                                byteorder='big'
+                            )
+                if track_id is not None and timescale:
+                    timescales[track_id] = timescale
+        return timescales
+
+    @classmethod
+    def read_mp4_fragment_start(cls, media_segment: bytes,
+                                track_timescales: Dict[int, int]) -> Optional[float]:
+        """读取 moof 内各轨道 tfdt，返回该媒体分段的最早时间。"""
+        starts = []
+        for moof_offset, moof_size, box_type, moof_header in cls.list_mp4_boxes(media_segment):
+            if box_type != b'moof':
+                continue
+            moof_end = moof_offset + moof_size
+            for traf_offset, traf_size, traf_type, traf_header in cls.list_mp4_boxes(
+                    media_segment, moof_offset + moof_header, moof_end):
+                if traf_type != b'traf':
+                    continue
+                track_id = None
+                base_decode_time = None
+                traf_end = traf_offset + traf_size
+                for child_offset, child_size, child_type, child_header in cls.list_mp4_boxes(
+                        media_segment, traf_offset + traf_header, traf_end):
+                    content_offset = child_offset + child_header
+                    if child_type == b'tfhd' and content_offset + 8 <= len(media_segment):
+                        track_id = int.from_bytes(
+                            media_segment[content_offset + 4:content_offset + 8],
+                            byteorder='big'
+                        )
+                    elif child_type == b'tfdt' and content_offset + 8 <= len(media_segment):
+                        version = media_segment[content_offset]
+                        value_size = 8 if version == 1 else 4
+                        value_offset = content_offset + 4
+                        if value_offset + value_size > child_offset + child_size:
+                            continue
+                        base_decode_time = int.from_bytes(
+                            media_segment[value_offset:value_offset + value_size],
+                            byteorder='big'
+                        )
+                timescale = track_timescales.get(track_id)
+                if timescale and base_decode_time is not None:
+                    starts.append(base_decode_time / timescale)
+        return min(starts) if starts else None
+
+    @staticmethod
+    async def stop_ffmpeg_process(process):
+        """幂等地终止 FFmpeg，并在温和退出超时后强制回收。"""
+        if not process or process.returncode is not None:
+            return
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            return
+        try:
+            await asyncio.wait_for(process.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await process.wait()
+
+    async def cancel_video_stream(self, websocket, widget_id: str):
+        sessions = self.video_streams.get(websocket, {})
+        session = sessions.pop(widget_id, None)
+        if session:
+            task = session.get('task')
+            process = session.get('process')
+            if task and task is not asyncio.current_task():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            else:
+                await self.stop_ffmpeg_process(process)
+        if not sessions:
+            self.video_streams.pop(websocket, None)
+
+    async def extend_video_stream_buffer(self, websocket, data):
+        """按前端水位请求放行同一个 FFmpeg 进程的后续数据。"""
+        widget_id = data.get('widgetId', '')
+        session = self.video_streams.get(websocket, {}).get(widget_id)
+        if not session or data.get('streamId') != session.get('streamId'):
+            return
+        try:
+            buffer_until = max(0.0, float(data.get('bufferUntil', 0) or 0))
+        except (TypeError, ValueError):
+            return
+        duration = float(session.get('duration', 0) or 0)
+        if duration > 0:
+            buffer_until = min(buffer_until, duration)
+        if buffer_until > session.get('bufferUntil', 0.0) + 0.05:
+            session['bufferUntil'] = buffer_until
+            session['flowEvent'].set()
+
+    async def stream_ffmpeg_output(self, websocket, widget_id: str, stream_id: str,
+                                   ffmpeg_path: str, video_path: str, start_time: float,
+                                   source_audio_codec: Optional[str] = None,
+                                   transcode_audio: bool = False):
+        session = self.video_streams[websocket][widget_id]
+        process = None
+        stderr_task = None
+        try:
+            command = [ffmpeg_path, '-hide_banner', '-loglevel', 'warning']
+            if start_time > 0:
+                command.extend(['-ss', f'{start_time:.3f}'])
+            command.extend([
+                '-i', video_path,
+                '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn',
+                '-c:v', 'copy'
+            ])
+            if transcode_audio:
+                # 音频转码远轻于视频转码；不加 -re，让 FFmpeg 按缓冲水位尽快产出 AAC。
+                # 统一采样到 48 kHz AAC-LC，避免 AMR 这类低采样率输入触发 AAC 码率上限。
+                command.extend([
+                    '-c:a', 'aac', '-profile:a', 'aac_low',
+                    '-ar:a', '48000', '-b:a', '128k'
+                ])
+            elif source_audio_codec:
+                command.extend(['-c:a', 'copy'])
+            if source_audio_codec == 'aac' and not transcode_audio:
+                # MPEG-TS 中的 AAC 通常采用 ADTS，比特流必须转换后才能写入 MP4。
+                command.extend(['-bsf:a', 'aac_adtstoasc'])
+            command.extend([
+                '-avoid_negative_ts', 'make_zero',
+                # 等首个媒体包经过 bitstream filter 后再写 moov，否则 TS/ADTS AAC
+                # 的 esds 会缺少 AudioSpecificConfig，Chromium 将拒绝初始化段。
+                '-movflags', 'frag_keyframe+empty_moov+default_base_moof+delay_moov',
+                '-frag_duration', '2000000', '-f', 'mp4', 'pipe:1'
+            ])
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            )
+            session['process'] = process
+
+            async def collect_stderr():
+                chunks = []
+                while True:
+                    chunk = await process.stderr.read(4096)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    if sum(map(len, chunks)) > 65536:
+                        chunks = chunks[-8:]
+                return b''.join(chunks).decode('utf-8', errors='replace')
+
+            stderr_task = asyncio.create_task(collect_stderr())
+            sequence = 0
+
+            mp4_buffer = bytearray()
+            pending_boxes = []
+            pending_box_types = []
+            track_timescales = {}
+            first_fragment_time = None
+
+            async def send_segment(segment_type: str):
+                nonlocal sequence, first_fragment_time
+                payload = b''.join(pending_boxes)
+                if not payload:
+                    return
+                if segment_type == 'init':
+                    track_timescales.update(self.read_mp4_track_timescales(payload))
+                    if not track_timescales:
+                        raise ValueError('无法从 fMP4 初始化段读取轨道 timescale')
+                elif segment_type == 'media':
+                    fragment_time = self.read_mp4_fragment_start(payload, track_timescales)
+                    if fragment_time is None:
+                        raise ValueError('无法从 fMP4 媒体段读取 tfdt 时间')
+                    if first_fragment_time is None:
+                        first_fragment_time = fragment_time
+                    media_offset = max(0.0, fragment_time - first_fragment_time)
+                    fragment_time_in_video = start_time + media_offset
+                    flow_event = session['flowEvent']
+                    while fragment_time_in_video > session['bufferUntil'] + 0.05:
+                        flow_event.clear()
+                        # clear 和 wait 之间可能刚收到新的放行请求，必须重新检查。
+                        if fragment_time_in_video <= session['bufferUntil'] + 0.05:
+                            continue
+                        await flow_event.wait()
+                await websocket.send(self.pack_video_chunk(
+                    stream_id, widget_id, sequence, payload, segment_type
+                ))
+                sequence += 1
+                pending_boxes.clear()
+                pending_box_types.clear()
+
+            async def process_boxes(boxes):
+                for box_type, box in boxes:
+                    # mfra 是文件末尾的随机访问索引，实时 MSE 播放不需要它。
+                    if box_type == b'mfra':
+                        continue
+                    pending_boxes.append(box)
+                    pending_box_types.append(box_type)
+                    if box_type == b'moov':
+                        await send_segment('init')
+                    elif box_type == b'mdat' and b'moof' in pending_box_types:
+                        await send_segment('media')
+
+            while True:
+                chunk = await process.stdout.read(256 * 1024)
+                if not chunk:
+                    break
+                mp4_buffer.extend(chunk)
+                await process_boxes(self.extract_mp4_boxes(mp4_buffer))
+
+            await process_boxes(self.extract_mp4_boxes(mp4_buffer, end_of_stream=True))
+            if mp4_buffer:
+                raise ValueError('FFmpeg 输出在 MP4 box 中途结束')
+            if pending_boxes and any(box_type != b'mfra' for box_type in pending_box_types):
+                raise ValueError('FFmpeg 输出包含不完整的 MP4 逻辑分段')
+
+            return_code = await process.wait()
+            stderr_text = await stderr_task
+            if return_code == 0:
+                await self.send_stream_json(
+                    websocket, 'VIDEO_STREAM_ENDED', widgetId=widget_id, streamId=stream_id
+                )
+            else:
+                error_line = stderr_text.strip().splitlines()[-1] if stderr_text.strip() else 'FFmpeg 退出'
+                await self.send_stream_json(
+                    websocket, 'VIDEO_STREAM_ERROR', widgetId=widget_id,
+                    streamId=stream_id, error=error_line
+                )
+        except asyncio.CancelledError:
+            await self.stop_ffmpeg_process(process)
+            if process and process.stdout:
+                await process.stdout.read()
+            raise
+        except Exception as e:
+            await self.stop_ffmpeg_process(process)
+            if process and process.stdout:
+                await process.stdout.read()
+            await self.send_stream_json(
+                websocket, 'VIDEO_STREAM_ERROR', widgetId=widget_id,
+                streamId=stream_id, error=str(e)
+            )
+        finally:
+            if stderr_task and not stderr_task.done():
+                stderr_task.cancel()
+            if stderr_task:
+                try:
+                    await stderr_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            sessions = self.video_streams.get(websocket, {})
+            current = sessions.get(widget_id)
+            if current and current.get('streamId') == stream_id:
+                sessions.pop(widget_id, None)
+            if not sessions:
+                self.video_streams.pop(websocket, None)
+
+    async def start_video_stream(self, websocket, data):
+        widget_id = data.get('widgetId', '')
+        requested_start_time = max(0.0, float(data.get('startTime', 0) or 0))
+        start_time = requested_start_time
+        await self.cancel_video_stream(websocket, widget_id)
+        stream_id = uuid.uuid4().hex
+        try:
+            video_path = self.resolve_video_path(data.get('rootPath'), data.get('videoPath'))
+            ffmpeg_path = self.get_ffmpeg_path()
+            loop = asyncio.get_running_loop()
+            media_info = await loop.run_in_executor(None, self.probe_video, ffmpeg_path, video_path)
+            if not media_info['videoSupported']:
+                print(
+                    f"[分类展示模块] 不支持的视频编码: {media_info['videoCodec']}，"
+                    "不会启动流进程或发送二进制数据"
+                )
+                await self.send_stream_json(
+                    websocket, 'VIDEO_STREAM_UNSUPPORTED', widgetId=widget_id,
+                    streamId=stream_id, mediaType='video',
+                    videoPath=data.get('videoPath'), videoCodec=media_info['videoCodec'],
+                    supportedVideoCodecs=sorted(self.SUPPORTED_VIDEO_CODECS),
+                    message='不支持该视频的视频编码格式'
+                )
+                return
+            if media_info.get('audioTranscoded'):
+                print(
+                    f"[分类展示模块] 音频编码 {media_info['sourceAudioCodec']} "
+                    "将实时转码为 AAC"
+                )
+            if media_info['duration'] > 0:
+                start_time = min(start_time, max(0.0, media_info['duration'] - 0.1))
+            if start_time > 0:
+                aligned_start_time = await loop.run_in_executor(
+                    None, self.align_seek_to_video_keyframe,
+                    ffmpeg_path, video_path, start_time
+                )
+                if media_info['duration'] > 0:
+                    aligned_start_time = min(
+                        aligned_start_time, max(0.0, media_info['duration'] - 0.1)
+                    )
+                if abs(aligned_start_time - start_time) > 0.05:
+                    print(
+                        f"[分类展示模块] Seek 从 {start_time:.3f}s "
+                        f"对齐到视频关键帧 {aligned_start_time:.3f}s"
+                    )
+                start_time = aligned_start_time
+            await self.send_stream_json(
+                websocket, 'VIDEO_STREAM_READY', widgetId=widget_id,
+                streamId=stream_id, startTime=start_time,
+                requestedStartTime=requested_start_time,
+                bufferHighWaterSeconds=self.VIDEO_STREAM_HIGH_WATER_SECONDS,
+                **media_info
+            )
+            initial_buffer_until = start_time + self.VIDEO_STREAM_HIGH_WATER_SECONDS
+            if media_info['duration'] > 0:
+                initial_buffer_until = min(initial_buffer_until, media_info['duration'])
+            session = {
+                'streamId': stream_id,
+                'process': None,
+                'task': None,
+                'duration': media_info['duration'],
+                'bufferUntil': initial_buffer_until,
+                'flowEvent': asyncio.Event()
+            }
+            self.video_streams.setdefault(websocket, {})[widget_id] = session
+            session['task'] = asyncio.create_task(self.stream_ffmpeg_output(
+                websocket, widget_id, stream_id, ffmpeg_path, video_path, start_time,
+                media_info.get('sourceAudioCodec'), media_info.get('audioTranscoded', False)
+            ))
+        except Exception as e:
+            await self.send_stream_json(
+                websocket, 'VIDEO_STREAM_ERROR', widgetId=widget_id,
+                streamId=stream_id, error=str(e)
+            )
+    
+    def init_database(self):
+        """初始化数据库"""
+        # 确保模块目录存在
+        if not os.path.exists(self.module_dir):
+            os.makedirs(self.module_dir)
+        
+        # 连接数据库
+        self.db_conn = sqlite3.connect(self.db_path)
+        self.db_cursor = self.db_conn.cursor()
+        
+        # 创建番剧表
+        self.db_cursor.execute('''
+            CREATE TABLE IF NOT EXISTS anime (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                root_path TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                name_pinyin TEXT DEFAULT '',
+                year INTEGER,
+                month INTEGER,
+                cover_path TEXT,
+                episode_count INTEGER DEFAULT 0,
+                entry_time INTEGER DEFAULT 0,
+                last_watch_order INTEGER DEFAULT 0,
+                last_watch_time INTEGER DEFAULT 0,
+                last_video_time REAL DEFAULT 0.0,
+                has_danmaku INTEGER DEFAULT 0
+            )
+        ''')
+
+        # 创建标签表
+        self.db_cursor.execute('''
+            CREATE TABLE IF NOT EXISTS tag (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                pinyin TEXT DEFAULT ''
+            )
+        ''')
+        
+        # 创建番剧-标签关联表
+        self.db_cursor.execute('''
+            CREATE TABLE IF NOT EXISTS anime_tag (
+                anime_id INTEGER NOT NULL,
+                tag_id INTEGER NOT NULL,
+                PRIMARY KEY (anime_id, tag_id),
+                FOREIGN KEY (anime_id) REFERENCES anime(id) ON DELETE CASCADE,
+                FOREIGN KEY (tag_id) REFERENCES tag(id) ON DELETE CASCADE
+            )
+        ''')
+        
+        # 创建索引加速查询
+        self.db_cursor.execute('CREATE INDEX IF NOT EXISTS idx_anime_tag_anime ON anime_tag(anime_id)')
+        self.db_cursor.execute('CREATE INDEX IF NOT EXISTS idx_anime_tag_tag ON anime_tag(tag_id)')
+        
+        self.db_conn.commit()
+        print(f"[分类展示模块] 数据库初始化完成: {self.db_path}")
+
+        #self.build_database()
+    
+    def build_database(self):
+        """建立数据库，扫描所有分类的文件"""
+        print("[分类展示模块] 开始建立数据库...")
+        
+        # 获取根目录列表
+        base_dirs = self.global_config.get('base_dir', [])
+        
+        # 扫描番剧分类
+        self.scan_anime_category(base_dirs)
+        
+        print("[分类展示模块] 数据库建立完成")
+    
+    def scan_anime_category(self, base_dirs: List[str]):
+        """扫描番剧分类"""
+        print("[分类展示模块] 扫描番剧分类...")
+
+        existing_paths = set()
+
+        for base_dir in base_dirs:
+            if not os.path.exists(base_dir):
+                print(f"[分类展示模块] 目录不存在: {base_dir}")
+                continue
+
+            for root, dirs, files in os.walk(base_dir):
+                if '__MD__.json' in files:
+                    md_path = os.path.join(root, '__MD__.json')
+                    try:
+                        with open(md_path, 'r', encoding='utf-8') as f:
+                            md_data = json.load(f)
+
+                        type_val = md_data.get('type')
+                        is_anime = (type_val == '番剧') or (isinstance(type_val, list) and '番剧' in type_val)
+                        if is_anime:
+                            self.process_anime_folder(root, md_data)
+                            existing_paths.add(root)
+                    except Exception as e:
+                        print(f"[分类展示模块] 处理 __MD__.json 失败: {md_path}, 错误: {e}")
+
+        self.cleanup_missing_anime(existing_paths)
+
+    def cleanup_missing_anime(self, existing_paths: set):
+        """清理已不存在的番剧条目"""
+        try:
+            self.db_cursor.execute('SELECT id, root_path FROM anime')
+            all_anime = self.db_cursor.fetchall()
+
+            removed_count = 0
+            for anime_id, root_path in all_anime:
+                if root_path not in existing_paths:
+                    self.db_cursor.execute('DELETE FROM anime_tag WHERE anime_id = ?', (anime_id,))
+                    self.db_cursor.execute('DELETE FROM anime WHERE id = ?', (anime_id,))
+                    removed_count += 1
+                    print(f"[分类展示模块] 移除不存在的番剧: {root_path}")
+
+            if removed_count > 0:
+                self.db_conn.commit()
+            print(f"[分类展示模块] 清理完成，移除了 {removed_count} 个不存在的番剧条目")
+        except Exception as e:
+            print(f"[分类展示模块] 清理不存在的番剧失败: {e}")
+    
+    def process_anime_folder(self, folder_path: str, md_data: Dict):
+        """处理番剧文件夹"""
+        root_path = folder_path
+        name = md_data.get('name', '')
+        year = md_data.get('year')
+        month = md_data.get('month')
+        tags_list = md_data.get('item', [])
+        cover_path = md_data.get('cover', '')
+        entry_time = md_data.get('entry-time', 0)
+
+        if cover_path and not os.path.isabs(cover_path):
+            cover_path = os.path.normpath(os.path.join(folder_path, cover_path))
+
+        episode_count = self.count_video_episodes(folder_path)
+        name_pinyin = self.get_pinyin(name)
+
+        # 读取观看历史
+        last_watch_order = 0
+        last_watch_time = 0
+        last_video_time = 0.0
+        history_path = os.path.join(root_path, '__HISTORY__.json')
+        if os.path.exists(history_path):
+            try:
+                with open(history_path, 'r', encoding='utf-8') as f:
+                    history_data = json.load(f)
+                if 'order' in history_data:
+                    last_watch_order = history_data['order']
+                if 'view-time' in history_data:
+                    last_watch_time = history_data['view-time']
+                if 'video-time' in history_data:
+                    last_video_time = history_data['video-time']
+            except Exception as e:
+                print(f"[分类展示模块] 读取 __HISTORY__.json 失败: {e}")
+
+        # 检查是否有弹幕（只要有一集有rmcf.json就算有弹幕）
+        has_danmaku = 0
+        video_extensions = set(ext.lower() for ext in video_type_list)
+        try:
+            for f in os.listdir(root_path):
+                if any(f.lower().endswith(ext) for ext in video_extensions):
+                    video_base = os.path.splitext(f)[0]
+                    dm_dir = os.path.join(root_path, f'{video_base}.files')
+                    dmcf_path = os.path.join(dm_dir, 'rmcf.json')
+                    if os.path.exists(dmcf_path):
+                        has_danmaku = 1
+                        break
+        except Exception as e:
+            print(f"[分类展示模块] 检查弹幕失败: {e}")
+
+        try:
+            self.db_cursor.execute('SELECT id FROM anime WHERE root_path = ?', (root_path,))
+            existing = self.db_cursor.fetchone()
+            if existing:
+                anime_id = existing[0]
+                self.db_cursor.execute('DELETE FROM anime_tag WHERE anime_id = ?', (anime_id,))
+            else:
+                anime_id = None
+
+            self.db_cursor.execute('''
+                INSERT OR REPLACE INTO anime (root_path, name, name_pinyin, year, month, cover_path, episode_count, entry_time, last_watch_order, last_watch_time, last_video_time, has_danmaku)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (root_path, name, name_pinyin, year, month, cover_path, episode_count, entry_time, last_watch_order, last_watch_time, last_video_time, has_danmaku))
+
+            #if anime_id is None:
+            self.db_cursor.execute('SELECT id FROM anime WHERE root_path = ?', (root_path,))
+            anime_id = self.db_cursor.fetchone()[0]
+
+            for tag_name in tags_list:
+                tag_name = tag_name.strip()
+                if not tag_name:
+                    continue
+
+                tag_pinyin = self.get_pinyin(tag_name)
+                self.db_cursor.execute('INSERT OR IGNORE INTO tag (name, pinyin) VALUES (?, ?)', (tag_name, tag_pinyin))
+                self.db_cursor.execute('SELECT id FROM tag WHERE name = ?', (tag_name,))
+                tag_id = self.db_cursor.fetchone()[0]
+                self.db_cursor.execute('INSERT OR IGNORE INTO anime_tag (anime_id, tag_id) VALUES (?, ?)', (anime_id, tag_id))
+
+            self.db_conn.commit()
+            print(f"[分类展示模块] 添加番剧: {name} ({year}), 剧集数: {episode_count}, 标签: {tags_list}")
+        except Exception as e:
+            print(f"[分类展示模块] 添加番剧失败: {name}, 错误: {e}")
+
+    
+
+    def get_pinyin(self, name: str) -> str:
+        """获取中文名称的拼音首字母"""
+        if not name:
+            return ''
+        
+        result = ''
+        for char in name:
+            if char in self.pinyin_dict:
+                pinyin = self.pinyin_dict[char]
+                if pinyin:
+                    result += pinyin[0]
+            else:
+                # 如果不在字典中，直接使用字符的小写形式
+                result += char.lower()
+        
+        return result
+    
+    def count_video_episodes(self, folder_path: str) -> int:
+        """统计文件夹下的视频文件数量"""
+        count = 0
+        video_extensions = set(ext.lower() for ext in video_type_list)
+        
+        try:
+            for entry in os.scandir(folder_path):
+                if entry.is_file():
+                    ext = os.path.splitext(entry.name)[1].lstrip('.')
+                    if ext in video_extensions:
+                        count += 1
+        except Exception as e:
+            print(f"[分类展示模块] 统计视频文件失败: {folder_path}, 错误: {e}")
+        
+        return count
+    
+    def get_all_anime(self) -> List[Dict]:
+        """获取所有番剧数据"""
+        self.db_cursor.execute('''
+            SELECT a.root_path, a.name, a.year, a.cover_path, a.episode_count, GROUP_CONCAT(t.name) as tags
+            FROM anime a
+            LEFT JOIN anime_tag at ON a.id = at.anime_id
+            LEFT JOIN tag t ON at.tag_id = t.id
+            GROUP BY a.id
+            ORDER BY a.year DESC, a.name
+        ''')
+        rows = self.db_cursor.fetchall()
+        
+        anime_list = []
+        for row in rows:
+            anime_list.append({
+                'root_path': row[0],
+                'name': row[1],
+                'year': row[2],
+                'cover_path': row[3],
+                'episode_count': row[4],
+                'tags': row[5].split(',') if row[5] else []
+            })
+        
+        return anime_list
+
+    def get_all_tags(self) -> List[str]:
+        """获取所有不重复的标签"""
+        self.db_cursor.execute('SELECT name FROM tag ORDER BY name')
+        rows = self.db_cursor.fetchall()
+
+        return [row[0] for row in rows]
+
+    def get_all_tags_with_id(self) -> List[Dict]:
+        """获取所有标签（带ID和拼音）"""
+        self.db_cursor.execute('SELECT id, name, pinyin FROM tag ORDER BY pinyin ASC, name ASC')
+        rows = self.db_cursor.fetchall()
+        return [{'id': row[0], 'name': row[1], 'pinyin': row[2] or ''} for row in rows]
+
+    def get_anime_detail(self, anime_id: int) -> Dict:
+        """获取番剧详情
+
+        Args:
+            anime_id: 番剧ID
+
+        Returns:
+            包含番剧详情的字典
+        """
+        self.db_cursor.execute('''
+            SELECT id, root_path, name, name_pinyin, year, month, cover_path, episode_count, entry_time
+            FROM anime WHERE id = ?
+        ''', (anime_id,))
+        row = self.db_cursor.fetchone()
+
+        if not row:
+            return {}
+
+        anime = {
+            'id': row[0],
+            'rootPath': row[1],
+            'name': row[2],
+            'pinyin': row[3] or '',
+            'year': row[4],
+            'month': row[5],
+            'coverPath': row[6],
+            'episodeCount': row[7],
+            'entryTime': row[8]
+        }
+
+        md_path = os.path.join(row[1], '__MD__.json')
+        if os.path.exists(md_path):
+            try:
+                with open(md_path, 'r', encoding='utf-8') as f:
+                    md_data = json.load(f)
+                anime['mdName'] = md_data.get('name', '')
+                anime['mdYear'] = md_data.get('year')
+                anime['mdMonth'] = md_data.get('month')
+                anime['tags'] = md_data.get('item', [])
+                anime['introduction'] = md_data.get('introduction')
+                anime['introductionSrc'] = md_data.get('introduction-src')
+                anime['episodeMap'] = md_data.get('episode-map', [])
+            except Exception as e:
+                print(f"[分类展示模块] 读取__MD__.json失败: {e}")
+                anime['tags'] = []
+                anime['introduction'] = None
+                anime['introductionSrc'] = None
+                anime['episodeMap'] = []
+        else:
+            anime['tags'] = []
+            anime['introduction'] = None
+            anime['introductionSrc'] = None
+            anime['episodeMap'] = []
+
+        has_danmu = False
+        danmu_sources = set()
+        root_path = row[1]
+        video_files = []
+
+        if anime['episodeMap']:
+            for ep in anime['episodeMap']:
+                video_files.append({
+                    'order': ep.get('order'),
+                    'path': ep.get('path'),
+                    'name': ep.get('name', '')
+                })
+        else:
+            if os.path.exists(root_path):
+                for f in os.listdir(root_path):
+                    if f.lower().endswith(tuple(f'.{ext}' for ext in video_type_list)):
+                        video_files.append({
+                            'order': len(video_files) + 1,
+                            'path': f,
+                            'name': ''
+                        })
+            video_files.sort(key=lambda x: x['path'])
+            for i in range(len(video_files)):
+                video_files[i]['order'] = i + 1 # 重置为正确的剧集顺序
+
+
+        anime['episodes'] = []
+        for ep in video_files:
+            video_name = ep['path']
+            video_base = os.path.splitext(video_name)[0]
+            dm_dir = os.path.join(root_path, f'{video_base}.files')
+            dmcf_json_path = os.path.join(dm_dir, 'rmcf.json')
+            dm_info_path = os.path.join(dm_dir, 'dm-info.json')
+
+            has_ep_danmu = os.path.exists(dmcf_json_path)
+            if has_ep_danmu:
+                has_danmu = True
+
+            ep_danmu_sources = []
+            if os.path.exists(dm_info_path):
+                try:
+                    with open(dm_info_path, 'r', encoding='utf-8') as f:
+                        dm_info = json.load(f)
+                    dm_src_list = dm_info.get('dm-src', [])
+                    for src in dm_src_list:
+                        src_name = src.get('name', '')
+                        if src_name:
+                            danmu_sources.add(src_name)
+                            ep_danmu_sources.append(src_name)
+                except Exception as e:
+                    print(f"[分类展示模块] 读取dm-info.json失败: {e}")
+
+            anime['episodes'].append({
+                'order': ep['order'],
+                'name': ep['name'],
+                'path': ep['path'],
+                'hasDanmu': has_ep_danmu,
+                'danmuSources': ep_danmu_sources
+            })
+
+        anime['hasDanmu'] = has_danmu
+        anime['danmuSources'] = list(danmu_sources)
+
+        self.db_cursor.execute('''
+            SELECT t.name FROM tag t
+            JOIN anime_tag at ON t.id = at.tag_id
+            WHERE at.anime_id = ?
+        ''', (anime_id,))
+        anime['dbTags'] = [row[0] for row in self.db_cursor.fetchall()]
+
+        #print(f"[分类展示模块] 剧集信息: {anime['episodes']}")
+        return anime
+
+    def get_anime_page(self, page: int = 1, page_size: int = 10, sort_by: str = 'year',
+                       sort_order: str = 'DESC',
+                       tag_filter_enabled: bool = False, selected_tags: List[int] = None) -> Dict:
+        """获取番剧分页数据
+
+        Args:
+            page: 页码（从1开始）
+            page_size: 每页数量
+            sort_by: 排序方式 ('year', 'addtime', 'pinyin')
+            sort_order: 排序顺序 ('DESC' 降序, 'ASC' 升序)
+            tag_filter_enabled: 是否启用标签筛选
+            selected_tags: 选中的标签ID列表
+
+        Returns:
+            包含番剧列表、总数、所有标签的字典
+        """
+        if selected_tags is None:
+            selected_tags = []
+
+        order_symbol = sort_order.upper() if sort_order.upper() in ('ASC', 'DESC') else 'DESC'
+
+        if sort_by == 'year':
+            order_clause = f'ORDER BY a.year {order_symbol}, a.name'
+        elif sort_by == 'addtime':
+            order_clause = f'ORDER BY a.entry_time {order_symbol}, a.name'
+        elif sort_by == 'pinyin':
+            order_clause = f'ORDER BY a.name_pinyin {order_symbol}, a.name'
+        else:
+            order_clause = f'ORDER BY a.year {order_symbol}, a.name'
+
+        # 构建标签筛选条件
+        if tag_filter_enabled and selected_tags:
+            placeholders = ','.join('?' * len(selected_tags))
+            tag_filter_clause = f'AND t.id IN ({placeholders})'
+            tag_filter_params = selected_tags
+        else:
+            tag_filter_clause = ''
+            tag_filter_params = []
+
+        # 获取总数
+        if tag_filter_enabled and selected_tags:
+            count_query = '''
+                SELECT COUNT(DISTINCT a.id)
+                FROM anime a
+                JOIN anime_tag at ON a.id = at.anime_id
+                JOIN tag t ON at.tag_id = t.id
+                WHERE t.id IN ({placeholders})
+                GROUP BY a.id
+                HAVING COUNT(DISTINCT t.id) >= {tag_count}
+            '''.format(placeholders=','.join('?' * len(selected_tags)), tag_count=len(selected_tags))
+            self.db_cursor.execute(count_query, tag_filter_params)
+            total = len(self.db_cursor.fetchall())
+        else:
+            self.db_cursor.execute('SELECT COUNT(*) FROM anime')
+            total = self.db_cursor.fetchone()[0]
+
+        # 计算分页
+        offset = (page - 1) * page_size
+
+        # 获取番剧列表
+        if tag_filter_enabled and selected_tags:
+            query = '''
+                SELECT a.id, a.root_path, a.name, a.year, a.cover_path, a.episode_count, a.name_pinyin,
+                       GROUP_CONCAT(DISTINCT t.name) as tags,
+                       GROUP_CONCAT(DISTINCT t.id) as tag_ids
+                FROM anime a
+                LEFT JOIN anime_tag at ON a.id = at.anime_id
+                LEFT JOIN tag t ON at.tag_id = t.id
+                WHERE a.id IN (
+                    SELECT DISTINCT a.id
+                    FROM anime a
+                    JOIN anime_tag at ON a.id = at.anime_id
+                    JOIN tag t ON at.tag_id = t.id
+                    WHERE t.id IN ({placeholders})
+                    GROUP BY a.id
+                    HAVING COUNT(DISTINCT t.id) >= {tag_count}
+                )
+                GROUP BY a.id
+                {order_clause}
+                LIMIT ? OFFSET ?
+            '''.format(placeholders=','.join('?' * len(selected_tags)), tag_count=len(selected_tags), order_clause=order_clause)
+            params = tag_filter_params + [page_size, offset]
+        else:
+            query = f'''
+                SELECT a.id, a.root_path, a.name, a.year, a.cover_path, a.episode_count, a.name_pinyin,
+                       GROUP_CONCAT(DISTINCT t.name) as tags,
+                       GROUP_CONCAT(DISTINCT t.id) as tag_ids
+                FROM anime a
+                LEFT JOIN anime_tag at ON a.id = at.anime_id
+                LEFT JOIN tag t ON at.tag_id = t.id
+                GROUP BY a.id
+                {order_clause}
+                LIMIT ? OFFSET ?
+            '''
+            params = [page_size, offset]
+
+        self.db_cursor.execute(query, params)
+        rows = self.db_cursor.fetchall()
+        print(rows)
+        anime_list = []
+        for row in rows:
+            tag_ids_str = row[8] or ''
+            tag_ids = [int(tid) for tid in tag_ids_str.split(',') if tid]
+            tags_str = row[7] or ''
+            tags = tags_str.split(',') if tags_str else []
+
+            anime_list.append({
+                'id': row[0],
+                'root_path': row[1],
+                'name': row[2],
+                'year': row[3],
+                'poster': row[4],
+                'episode_count': row[5],
+                'name_pinyin': row[6] or '',
+                'tags': tags,
+                'tag_ids': tag_ids
+            })
+
+        # 获取所有标签
+        all_tags = self.get_all_tags_with_id()
+
+        return {
+            'animeList': anime_list,
+            'total': total,
+            'allTags': all_tags,
+            'page': page,
+            'pageSize': page_size,
+            'totalPages': (total + page_size - 1) // page_size if page_size > 0 else 1
+        }
+
+    def make_danmaku_data(self, remap_config_list, dm_dir):
+        """根据重映射配置从dm_dir目录读取弹幕数据"""
+        def get_time(item):
+            time_val = item.get('time')
+            if time_val is None:
+                item['time'] = 0
+                return 0
+            try:
+                return float(time_val)
+            except (ValueError, TypeError):
+                return 0
+
+        def apply_time_filter(danmaku_list, time_filter):
+            if not time_filter:
+                return danmaku_list
+            filtered = []
+            for dm in danmaku_list:
+                time = get_time(dm)
+                start_time = time_filter[0][0]
+                for range_start, range_end in time_filter:
+                    if range_start < start_time:
+                        start_time = range_start
+                dm['time'] = time - start_time
+                for range_start, range_end in time_filter:
+                    if range_start <= time <= range_end:
+                        filtered.append(dm)
+                        break
+            return filtered
+
+        def apply_remap(time, cut_time, add_time_list):
+            if cut_time > 0:
+                first_time = 2 * cut_time
+                a = 1 / (4 * cut_time)
+                if time < first_time:
+                    time = a * time * time
+                else:
+                    time = time - cut_time
+
+            if add_time_list:
+                sorted_add_time = sorted(add_time_list, key=lambda x: x[0])
+                for start, end in sorted_add_time:
+                    if time > start:
+                        time = time + (end - start)
+            return time
+
+        def process_config(input_file, config):
+            with open(input_file, 'r', encoding='utf-8') as f:
+                danmaku_list = json.load(f)
+            time_filter = config.get('time_filter', [])
+            cut_time = config.get('cut_time', 0)
+            add_time = config.get('add_time', [])
+            filtered = apply_time_filter(danmaku_list, time_filter)
+            sorted_list = sorted(filtered, key=get_time)
+            for item in sorted_list:
+                time = get_time(item)
+                time = apply_remap(time, cut_time, add_time)
+                item['time'] = time
+            return sorted_list
+
+        def get_source_info(danmaku_list):
+            src_dict = {}
+            for dm in danmaku_list:
+                src = dm.get('src', '未知')
+                send_time = dm.get('send-time', 0)
+                if src not in src_dict:
+                    src_dict[src] = {'send_times': [], 'count': 0}
+                src_dict[src]['send_times'].append(send_time)
+                src_dict[src]['count'] += 1
+
+            dm_src_list = []
+            for name, data in src_dict.items():
+                update_time = max(data['send_times']) if data['send_times'] else 0
+                dm_src_list.append({
+                    'name': name,
+                    'url': '',
+                    'update-time': update_time,
+                    'dm-count': data['count']
+                })
+            return dm_src_list
+
+        folder_path = os.path.abspath(dm_dir)
+        config_list = remap_config_list
+        print(f"[分类展示模块] 加载了 {len(config_list)} 个弹幕映射配置项\n")
+        all_danmaku = []
+        all_source_info = []
+
+        for i, config in enumerate(config_list):
+            dmsrc_file = config.get('dmsrc-file', '')
+            print(f"[分类展示模块] [{i+1}/{len(config_list)}] 处理: {dmsrc_file}")
+
+            input_file = os.path.join(folder_path, dmsrc_file)
+            if not os.path.exists(input_file):
+                print(f"[分类展示模块] 错误: 文件不存在 {input_file}")
+                continue
+
+            processed = process_config(input_file, config)
+            print(f"[分类展示模块] 处理了 {len(processed)} 条弹幕")
+            all_danmaku.extend(processed)
+
+            source_info = get_source_info(processed)
+            all_source_info.extend(source_info)
+
+        all_danmaku = sorted(all_danmaku, key=get_time)
+        print(f"[分类展示模块] 合并后共 {len(all_danmaku)} 条弹幕")
+
+        build_time = int(time.time())
+
+        dm_info = {
+            'dm-src': all_source_info,
+            'dmjs-build-time': build_time,
+            'dm-count': len(all_danmaku)
+        }
+        info_file = os.path.join(folder_path, "dm-info.json")
+        with open(info_file, 'w', encoding='utf-8') as f:
+            json.dump(dm_info, f, ensure_ascii=False, indent=4)
+        print(f"[分类展示模块] 成功将弹幕信息写入 {info_file}")
+
+        # 获取用户保存的弹幕配置
+        danmaku_config = self.config.get('video-config', {}).get('danmaku-config', {
+            'speed': 0.75,
+            'fontsizeScale': 1.0,
+            'area': 0.75
+        })
+        
+        danmaku_option = {
+            "speed": danmaku_config.get('speed', 0.75),
+            "fontsizeScale": danmaku_config.get('fontsizeScale', 16),
+            "area": danmaku_config.get('area', 0.75),
+            "items": all_danmaku  
+        }
+
+        return danmaku_option
+
+    def get_comment_config(self, updates=None):
+        """取得评论面板配置；缺少默认项或有设置更新时写回配置文件。"""
+        video_config = self.config.setdefault('video-config', {})
+        config = video_config.setdefault('comment-config', {})
+        changed = False
+        for key, value in COMMENT_CONFIG_DEFAULTS.items():
+            if key not in config:
+                config[key] = value
+                changed = True
+        if updates:
+            for key, value in updates.items():
+                if key in COMMENT_CONFIG_DEFAULTS and config.get(key) != value:
+                    config[key] = value
+                    changed = True
+        if changed:
+            self.save_config()
+        return dict(config)
+
+
+    @staticmethod
+    def read_comment_json(path, expected_type, default):
+        if not os.path.isfile(path):
+            return default
+        try:
+            with open(path, 'r', encoding='utf-8') as file:
+                value = json.load(file)
+            return value if isinstance(value, expected_type) else default
+        except (OSError, json.JSONDecodeError) as error:
+            print(f"[分类展示模块] 读取评论配置失败 {path}: {error}")
+            return default
+
+    @staticmethod
+    def write_comment_json(path, value):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        temporary_path = path + '.tmp'
+        with open(temporary_path, 'w', encoding='utf-8') as file:
+            json.dump(value, file, ensure_ascii=False, indent=2)
+        os.replace(temporary_path, path)
+
+    @staticmethod
+    def inspect_comment_database(database_path):
+        """从 v1.1 数据库读取来源元数据以及 main/reply 的精确行数。"""
+        path = Path(database_path).resolve()
+        connection = _open_comment_database_readonly(path)
+        try:
+            tables = {
+                row[0] for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if not {'_metadata', 'main', 'reply'}.issubset(tables):
+                raise ValueError('评论数据库缺少 _metadata、main 或 reply 表')
+            metadata = dict(connection.execute(
+                'SELECT metadata_key,metadata_value FROM _metadata'
+            ))
+            comment_count = int(connection.execute(
+                'SELECT COUNT(*) FROM main'
+            ).fetchone()[0])
+            reply_count = int(connection.execute(
+                'SELECT COUNT(*) FROM reply'
+            ).fetchone()[0])
+            return metadata, comment_count, reply_count
+        finally:
+            connection.close()
+
+    @staticmethod
+    def comment_created_timestamp(metadata):
+        value = metadata.get('created_at_utc', '')
+        if not value:
+            return 0
+        try:
+            return int(datetime.datetime.fromisoformat(
+                value.replace('Z', '+00:00')
+            ).timestamp())
+        except (ValueError, TypeError):
+            return 0
+
+    def collect_comment_info(self, metadata_path):
+        """按 cmif -> cm-list -> 数据库回退顺序组装评论来源信息。"""
+        config = self.get_comment_config()
+        record_path = os.path.join(metadata_path, '__COMMENT-RECORD__.json')
+        record = self.read_comment_json(record_path, dict, {})
+        cmif_path = os.path.join(metadata_path, 'cmif.json')
+        comment_dir = os.path.join(os.path.dirname(metadata_path), '__COMMENT__')
+        update_dir = os.path.join(comment_dir, 'update')
+        cm_list_path = os.path.join(comment_dir, 'cm-list.json')
+        cmif = self.read_comment_json(cmif_path, list, [])
+        if not cmif:
+            return {
+                'totalCount': 0,
+                'sources': [],
+                'config': config,
+                'record': record,
+                'metadataPath': metadata_path,
+                'cmListPath': cm_list_path,
+            }
+
+        cm_list = self.read_comment_json(cm_list_path, dict, {})
+        by_file_name = {
+            str(value.get('file-name')): (bvid, value)
+            for bvid, value in cm_list.items()
+            if isinstance(value, dict) and value.get('file-name')
+        }
+        sources = []
+        cm_list_changed = False
+        for item in cmif:
+            if not isinstance(item, dict):
+                continue
+            file_name = str(item.get('comment-srcfile', '')).strip()
+            if not re.fullmatch(r'cm\d+\.db', file_name, re.I):
+                continue
+            database_path = os.path.realpath(os.path.join(comment_dir, file_name))
+            if not os.path.isfile(database_path):
+                print(f"[分类展示模块] 跳过不存在的评论数据库: {database_path}")
+                continue
+
+            bvid, list_entry = by_file_name.get(file_name, ('', {}))
+            list_entry = dict(list_entry) if isinstance(list_entry, dict) else {}
+            required_keys = {'update-time', 'comment-count', 'reply-count'}
+            needs_database = not bvid or not required_keys.issubset(list_entry)
+            metadata = {}
+            if needs_database:
+                try:
+                    metadata, comment_count, reply_count = self.inspect_comment_database(
+                        database_path
+                    )
+                except Exception as error:
+                    print(f"[分类展示模块] 解析评论数据库失败 {database_path}: {error}")
+                    continue
+                bvid = bvid or str(metadata.get('bvid', ''))
+                if not bvid:
+                    print(f"[分类展示模块] 评论数据库缺少 bvid: {database_path}")
+                    continue
+                list_entry.update({
+                    'file-name': file_name,
+                    'aid': int(metadata.get('aid', 0) or 0),
+                    'update-time': self.comment_created_timestamp(metadata),
+                    'comment-count': comment_count,
+                    'reply-count': reply_count,
+                })
+                cm_list[bvid] = list_entry
+                by_file_name[file_name] = (bvid, list_entry)
+                cm_list_changed = True
+
+            source_name = str(list_entry.get('src-name', '') or '').strip()
+            if not source_name:
+                source_name = bvid
+                list_entry['src-name'] = source_name
+                cm_list[bvid] = list_entry
+                by_file_name[file_name] = (bvid, list_entry)
+                cm_list_changed = True
+                print(
+                    f"[分类展示模块] 评论来源缺少 src-name，"
+                    f"已使用 BV 号补全: {bvid}"
+                )
+
+            resource_folder = str(item.get('resource-folder', '') or '').strip()
+            basic_folder = str(item.get('basic-resfolder') or 'bilibili-resource')
+            sources.append({
+                'bvid': bvid,
+                'databasePath': database_path,
+                'updateDir': update_dir if os.path.isdir(update_dir) else '',
+                'sourceName': source_name,
+                'sourceType': str(item.get('src') or 'B站'),
+                'commentCount': max(0, int(list_entry.get('comment-count', 0) or 0)),
+                'replyCount': max(0, int(list_entry.get('reply-count', 0) or 0)),
+                'updateTime': max(0, int(list_entry.get('update-time', 0) or 0)),
+                'resource-folder': resource_folder,
+                'basicResourceFolder': basic_folder,
+                'fileName': file_name,
+            })
+
+        if cm_list_changed:
+            self.write_comment_json(cm_list_path, cm_list)
+        return {
+            'totalCount': sum(source['commentCount'] for source in sources),
+            'sources': sources,
+            'config': config,
+            'record': record,
+            'metadataPath': metadata_path,
+            'cmListPath': cm_list_path,
+        }
+
+    def set_comment_source_info(self, data):
+        """修改 cm-list.json 中一个评论来源允许编辑的字段。"""
+        cm_list_path = str(data.get('cmListPath', '') or '').strip()
+        if not cm_list_path:
+            raise ValueError('缺少 cm-list.json 路径')
+        cm_list_path = os.path.realpath(os.path.abspath(
+            os.path.normpath(cm_list_path)
+        ))
+        if os.path.basename(cm_list_path).lower() != 'cm-list.json':
+            raise ValueError('评论来源信息文件必须为 cm-list.json')
+
+        allowed_roots = [
+            os.path.realpath(os.path.abspath(path))
+            for path in self.global_config.get('base_dir', [])
+        ]
+        if allowed_roots and not any(
+                self.is_path_within(root, cm_list_path) for root in allowed_roots):
+            raise ValueError('cm-list.json 不在已配置的资源目录中')
+        if not os.path.isfile(cm_list_path):
+            raise FileNotFoundError(f'cm-list.json 不存在: {cm_list_path}')
+
+        bvid = str(data.get('bvid', '') or '').strip()
+        if not bvid:
+            raise ValueError('缺少评论来源 BV 号')
+        key = str(data.get('key', '') or '').strip()
+        if key not in COMMENT_SOURCE_INFO_EDITABLE_KEYS:
+            raise ValueError(f'不允许修改评论来源字段: {key or "(空)"}')
+        value = str(data.get('value', '') or '').strip()
+        if not value:
+            raise ValueError('评论来源名称不能为空')
+        if len(value) > 200:
+            raise ValueError('评论来源名称不能超过 200 个字符')
+
+        try:
+            with open(cm_list_path, 'r', encoding='utf-8') as file:
+                cm_list = json.load(file)
+        except json.JSONDecodeError as error:
+            raise ValueError(f'cm-list.json 格式错误: {error}') from error
+        if not isinstance(cm_list, dict):
+            raise ValueError('cm-list.json 顶层必须为字典')
+        target = cm_list.get(bvid)
+        if not isinstance(target, dict):
+            raise ValueError(f'cm-list.json 中没有评论来源 {bvid}')
+
+        target[key] = value
+        self.write_comment_json(cm_list_path, cm_list)
+        return {
+            'cmListPath': cm_list_path,
+            'bvid': bvid,
+            'key': key,
+            'value': value,
+        }
+
+    def load_comment_deletelist(self, database_path, update_dir):
+        """读取 cmN.deletelist；缺失时从同来源全部增量数据库重建。"""
+        if not update_dir:
+            return set()
+        update_dir = os.path.realpath(os.path.abspath(update_dir))
+        expected_update_dir = os.path.realpath(os.path.join(
+            os.path.dirname(database_path), 'update'
+        ))
+        if update_dir != expected_update_dir or not os.path.isdir(update_dir):
+            return set()
+        stem = os.path.splitext(os.path.basename(database_path))[0]
+        deletelist_path = os.path.join(update_dir, stem + '.deletelist')
+        if os.path.isfile(deletelist_path):
+            values = self.read_comment_json(deletelist_path, list, [])
+            return {
+                int(value) for value in values
+                if not isinstance(value, bool) and str(value).lstrip('-').isdigit()
+            }
+
+        deleted = set()
+        pattern = re.compile(re.escape(stem) + r'-\d+\.db$', re.I)
+        for name in sorted(os.listdir(update_dir)):
+            if not pattern.fullmatch(name):
+                continue
+            delta_path = Path(update_dir, name).resolve()
+            connection = _open_comment_database_readonly(delta_path)
+            try:
+                exists = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='_deleted_records'"
+                ).fetchone()
+                if exists:
+                    deleted.update(
+                        int(row[0]) for row in connection.execute(
+                            'SELECT DISTINCT rpid FROM _deleted_records'
+                        )
+                    )
+            finally:
+                connection.close()
+        self.write_comment_json(deletelist_path, sorted(deleted))
+        return deleted
+
+    def save_comment_read_record(self, metadata_path, bvid, page, page_count):
+        record = {
+            'view-time': int(time.time()),
+            'last-read-src-BV': str(bvid or ''),
+            'last-read-page': max(1, int(page)),
+            'last-pagecount': min(max(1, int(page_count)), 200),
+        }
+        record_path = os.path.join(metadata_path, '__COMMENT-RECORD__.json')
+        try:
+            self.write_comment_json(record_path, record)
+            return True
+        except OSError as error:
+            print(f"[分类展示模块] 保存评论阅读记录失败 {record_path}: {error}")
+            return False
+
+    def build_comment_html_response(self, data):
+        metadata_path = str(data.get('metadataPath', '') or '').strip()
+        if not metadata_path:
+            raise ValueError('缺少视频元数据文件夹路径')
+        metadata_path = os.path.abspath(os.path.normpath(metadata_path))
+        database_path = str(data.get('databasePath', '') or '').strip()
+        if not database_path:
+            raise ValueError('缺少评论数据库路径')
+        database_path = os.path.abspath(os.path.normpath(database_path))
+        if not re.fullmatch(r'cm\d+\.db', os.path.basename(database_path), re.I):
+            raise ValueError('评论数据库文件名不符合 cm<number>.db 规则')
+        normalized_database_path = os.path.normcase(database_path)
+        allowed_roots = [
+            os.path.normcase(os.path.abspath(os.path.normpath(path)))
+            for path in self.global_config.get('base_dir', [])
+        ]
+        database_in_allowed_root = not allowed_roots
+        for allowed_root in allowed_roots:
+            try:
+                if os.path.commonpath([
+                    allowed_root, normalized_database_path
+                ]) == allowed_root:
+                    database_in_allowed_root = True
+                    break
+            except ValueError:
+                continue
+        if not database_in_allowed_root:
+            raise ValueError('评论数据库不在已配置的资源目录中')
+        sort_by = data.get('sortBy', 'time')
+        if sort_by not in {'time', 'like'}:
+            sort_by = 'time'
+        page = max(1, int(data.get('page', 1) or 1))
+        page_size = min(max(int(data.get('pageSize', 20) or 20), 1), 200)
+        keyword = str(data.get('keyword', '') or '').strip()
+        if not bool(data.get('keywordEnabled', bool(keyword))):
+            keyword = ''
+        mark_deleted = bool(data.get('markDeleted', False))
+        only_deleted = bool(data.get('onlyDeleted', False))
+        only_vip = bool(data.get('onlyVip', False))
+        word_filter_enabled = bool(data.get('wordFilterEnabled', False))
+        word_count = max(0, int(data.get('wordCount', 0) or 0))
+        word_direction = 'below' if data.get('wordDirection') == 'below' else 'above'
+        update_dir = str(data.get('updateDir', '') or '')
+        deleted_rpids = (
+            self.load_comment_deletelist(database_path, update_dir)
+            if (mark_deleted or only_deleted) and update_dir else set()
+        )
+        if not update_dir:
+            mark_deleted = False
+            only_deleted = False
+
+        result = load_comment_page_from_database(
+            database_path, sort_by, page, page_size,
+            keyword=keyword,
+            only_deleted=only_deleted,
+            only_vip=only_vip,
+            word_filter_enabled=word_filter_enabled,
+            word_count=word_count,
+            word_direction=word_direction,
+            deleted_rpids=deleted_rpids if (mark_deleted or only_deleted) else set(),
+            connection_manager=self.comment_page_connection_manager,
+        )
+        resource_root = str(data.get('resourcePath', '') or '').strip()
+        if not resource_root:
+            raise ValueError('缺少评论资源根目录路径')
+        # resourcePath 来自 CS_COMMENT_INFO 返回的 resource-folder 计算结果。
+        # 此处仅作不访问文件系统的字符串规范化，不检查其中的目录或资源文件。
+        resource_root = os.path.abspath(os.path.normpath(resource_root))
+        basic_folder = str(
+            data.get('basicResourceFolder') or 'bilibili-resource'
+        ).strip() or 'bilibili-resource'
+        result['html'] = build_comment_font_style(
+            resource_root, basic_folder
+        ) + ''.join(
+            comment_to_comment_html(
+                comment, resource_root, basic_folder,
+                mark_deleted=mark_deleted,
+            )
+            for comment in result['comments']
+        )
+        result.pop('comments', None)
+        result['databasePath'] = database_path
+
+        config_updates = {
+            'sort-by': sort_by,
+            'mark-deleted': mark_deleted,
+            'only-deleted': only_deleted,
+            'only-vip': only_vip,
+            'word-filter-enabled': word_filter_enabled,
+            'word-count': word_count,
+            'word-direction': word_direction,
+        }
+        if bool(data.get('updatePageSizeDefault', False)):
+            config_updates['page-size'] = page_size
+        self.get_comment_config(config_updates)
+        if bool(data.get('updateReadRecord', False)) \
+                or result['page'] != result['requestedPage']:
+            self.save_comment_read_record(
+                metadata_path, data.get('bvid', ''), result['page'], page_size
+            )
+        return result
+
+
+
+    ######################
+    #以下实现必要的接口
+    ######################
+
+    async def when_connect(self, websocket):
+        """当连接建立时调用"""
+        print("[分类展示模块] 连接建立成功")
+        #self.add_pinyin_column()
+        #self.update_anime_pinyin()
+
+    async def when_disconnect(self, websocket):
+        """当连接断开时调用"""
+        widget_ids = list(self.video_streams.get(websocket, {}).keys())
+        for widget_id in widget_ids:
+            await self.cancel_video_stream(websocket, widget_id)
+        print("[分类展示模块] 连接断开")
+
+    async def shutdown(self):
+        """服务退出时回收全部 FFmpeg 流和数据库连接。"""
+        for websocket, sessions in list(self.video_streams.items()):
+            for widget_id in list(sessions.keys()):
+                await self.cancel_video_stream(websocket, widget_id)
+        self.comment_page_connection_manager.close()
+        db_conn = getattr(self, 'db_conn', None)
+        if db_conn is not None:
+            db_conn.close()
+            self.db_conn = None
+            self.db_cursor = None
+
+    async def message_proc(self, websocket, data):
+        """处理消息"""
+        command = data.get('command')
+
+        if command == 'CLASSIFY_SHOWER_ACTIVATED':
+            print("[分类展示模块] 收到激活消息")
+            #await self.send_classify_data(websocket)
+
+        elif command in ('START_VIDEO_STREAM', 'SEEK_VIDEO_STREAM'):
+            await self.start_video_stream(websocket, data)
+
+        elif command == 'CANCEL_VIDEO_STREAM':
+            await self.cancel_video_stream(websocket, data.get('widgetId', ''))
+
+        elif command == 'BUFFER_VIDEO_STREAM':
+            await self.extend_video_stream_buffer(websocket, data)
+
+        elif command == 'GET_ALL_TAGS':
+            print("[分类展示模块] 收到获取所有标签请求")
+            tags = self.get_all_tags()
+            message = json.dumps({
+                'command': 'ALL_TAGS',
+                'data': tags
+            }, ensure_ascii=False)
+            await websocket.send(message)
+            print(f"[分类展示模块] 发送所有标签，共 {len(tags)} 个")
+
+        elif command == 'GET_ANIME_PAGE':
+            widget_id = data.get('widgetId', '')
+            page = data.get('page', 1)
+            page_size = data.get('pageSize', 10)
+            sort_by = data.get('sortBy', 'year')
+            sort_order = data.get('sortOrder', 'DESC')
+            tag_filter_enabled = data.get('tagFilterEnabled', False)
+            selected_tags = data.get('selectedTags', [])
+
+            print(f"[分类展示模块] 收到获取番剧分页请求: page={page}, sortBy={sort_by}, sortOrder={sort_order}, tagFilter={tag_filter_enabled}")
+            result = self.get_anime_page(page, page_size, sort_by, sort_order, tag_filter_enabled, selected_tags)
+
+            message = json.dumps({
+                'command': 'ANIME_PAGE_DATA',
+                'widgetId': widget_id,
+                'animeList': result['animeList'],
+                'total': result['total'],
+                'allTags': result['allTags'],
+                'page': result['page'],
+                'pageSize': result['pageSize'],
+                'totalPages': result['totalPages']
+            }, ensure_ascii=False)
+            await websocket.send(message)
+            print(f"[分类展示模块] 发送番剧分页数据，共 {len(result['animeList'])} 条")
+
+        elif command == 'GET_ANIME_DETAIL':
+            widget_id = data.get('widgetId', '')
+            anime_id = data.get('animeId')
+            print(f"[分类展示模块] 收到获取番剧详情请求: animeId={anime_id}")
+            result = self.get_anime_detail(anime_id)
+            message = json.dumps({
+                'command': 'ANIME_DETAIL_DATA',
+                'widgetId': widget_id,
+                'animeDetail': result
+            }, ensure_ascii=False)
+            await websocket.send(message)
+            print(f"[分类展示模块] 发送番剧详情数据")
+
+        elif command == 'GET_CS_VIDEO_DATA':
+            widget_id = data.get('widgetId', '')
+            root_path = data.get('rootPath')
+            video_path = data.get('videoPath')
+            print(f"[分类展示模块] 收到获取视频数据请求: rootPath={root_path}, videoPath={video_path}")
+            
+            danmaku_data = []
+            has_danmaku = False
+            auto_seek_time = 0
+            if root_path and video_path:
+                video_base = os.path.splitext(video_path)[0]
+                dm_dir = os.path.join(root_path, f'{video_base}.files')
+                dmcf_json_path = os.path.join(dm_dir, 'rmcf.json')
+                
+                if os.path.exists(dmcf_json_path):
+                    try:
+                        with open(dmcf_json_path, 'r', encoding='utf-8') as f:
+                            remap_config = json.load(f)
+                        danmaku_data = self.make_danmaku_data(remap_config, dm_dir)
+                        has_danmaku = True
+                        print(f"[分类展示模块] 读取 rmcf.json 成功")
+                    except Exception as e:
+                        print(f"[分类展示模块] 读取 rmcf.json 失败: {e}")
+                
+                # 读取观看记录
+                record_path = os.path.join(dm_dir, '__RECORD__.json')
+                if os.path.exists(record_path):
+                    try:
+                        with open(record_path, 'r', encoding='utf-8') as f:
+                            record_data = json.load(f)
+                        if 'video-time' in record_data:
+                            auto_seek_time = record_data['video-time']
+                        print(f"[分类展示模块] 读取观看记录成功: {auto_seek_time}")
+                    except Exception as e:
+                        print(f"[分类展示模块] 读取 __RECORD__.json 失败: {e}")
+
+            message = json.dumps({
+                'command': 'CS_VIDEO_DATA',
+                'widgetId': widget_id,
+                'has-danmaku': has_danmaku,
+                'danmaku-data': danmaku_data,
+                'auto-seek-time': auto_seek_time
+            }, ensure_ascii=False)
+            await websocket.send(message)
+
+        elif command == 'CS_GET_COMMENT_INFO':
+            widget_id = data.get('widgetId', '')
+            request_id = data.get('requestId', '')
+            try:
+                metadata_path = str(data.get('metadataPath', '') or '').strip()
+                if not metadata_path:
+                    raise ValueError('缺少视频元数据文件夹路径')
+                metadata_path = os.path.abspath(os.path.normpath(metadata_path))
+                result = self.collect_comment_info(metadata_path)
+                message = {
+                    'command': 'CS_COMMENT_INFO',
+                    'widgetId': widget_id,
+                    'requestId': request_id,
+                    **result,
+                }
+                print(
+                    f"[分类展示模块] 发送评论来源信息，共 "
+                    f"{len(result['sources'])} 个来源、{result['totalCount']} 条评论"
+                )
+            except Exception as error:
+                print(f"[分类展示模块] 获取评论来源信息失败: {error}")
+                message = {
+                    'command': 'CS_COMMENT_ERROR',
+                    'widgetId': widget_id,
+                    'requestId': request_id,
+                    'stage': 'info',
+                    'error': str(error),
+                }
+            await websocket.send(json.dumps(message, ensure_ascii=False))
+
+        elif command == 'CS_GET_COMMENT_HTML':
+            widget_id = data.get('widgetId', '')
+            request_id = data.get('requestId', '')
+            try:
+                result = self.build_comment_html_response(data)
+                if result['page'] != result['requestedPage']:
+                    await websocket.send(json.dumps({
+                        'command': 'CS_COMMENT_SETPAGE',
+                        'widgetId': widget_id,
+                        'requestId': request_id,
+                        'page': result['page'],
+                        'totalPages': result['totalPages'],
+                    }, ensure_ascii=False))
+                message = {
+                    'command': 'CS_COMMENT_HTML',
+                    'widgetId': widget_id,
+                    'requestId': request_id,
+                    **result,
+                }
+                print(
+                    f"[分类展示模块] 发送第 {result['page']}/"
+                    f"{result['totalPages']} 页评论 HTML"
+                )
+            except Exception as error:
+                print(f"[分类展示模块] 生成评论 HTML 失败: {error}")
+                message = {
+                    'command': 'CS_COMMENT_ERROR',
+                    'widgetId': widget_id,
+                    'requestId': request_id,
+                    'stage': 'html',
+                    'error': str(error),
+                }
+            await websocket.send(json.dumps(message, ensure_ascii=False))
+
+        elif command == 'CS_SET_COMMENT_SOURCEINFO':
+            widget_id = data.get('widgetId', '')
+            request_id = data.get('requestId', '')
+            try:
+                result = self.set_comment_source_info(data)
+                message = {
+                    'command': 'CS_COMMENT_SOURCEINFO_SET',
+                    'widgetId': widget_id,
+                    'requestId': request_id,
+                    **result,
+                }
+                print(
+                    f"[分类展示模块] 已更新评论来源 "
+                    f"{result['bvid']} 的 {result['key']}"
+                )
+            except Exception as error:
+                print(f"[分类展示模块] 修改评论来源信息失败: {error}")
+                message = {
+                    'command': 'CS_COMMENT_ERROR',
+                    'widgetId': widget_id,
+                    'requestId': request_id,
+                    'stage': 'source-info',
+                    'error': str(error),
+                }
+            await websocket.send(json.dumps(message, ensure_ascii=False))
+
+        elif command == 'REFRESH_ANIME_DATABASE':
+            widget_id = data.get('widgetId', '')
+            print("[分类展示模块] 收到刷新数据库请求")
+            self.build_database()
+            message = json.dumps({
+                'command': 'DATABASE_REBUILD_COMPLETE',
+                'widgetId': widget_id
+            }, ensure_ascii=False)
+            await websocket.send(message)
+            print("[分类展示模块] 数据库重建完成")
+
+        elif command == 'SAVE_WATCH_RECORD':
+            widget_id = data.get('widgetId', '')
+            root_path = data.get('rootPath')
+            video_path = data.get('videoPath')
+            video_time = data.get('videoTime', 0)
+            episode_order = data.get('episodeOrder', 0)
+            print(f"[分类展示模块] 收到保存观看记录请求: rootPath={root_path}, videoPath={video_path}, videoTime={video_time}, episodeOrder={episode_order}")
+            
+            success = False
+            if root_path and video_path:
+                try:
+                    video_base = os.path.splitext(video_path)[0]
+                    dm_dir = os.path.join(root_path, f'{video_base}.files')
+                    
+                    # 确保目录存在
+                    os.makedirs(dm_dir, exist_ok=True)
+                    
+                    # 保存 __RECORD__.json
+                    record_path = os.path.join(dm_dir, '__RECORD__.json')
+                    record_data = {
+                        'view-time': int(time.time()),
+                        'video-time': video_time
+                    }
+                    with open(record_path, 'w', encoding='utf-8') as f:
+                        json.dump(record_data, f, ensure_ascii=False, indent=2)
+                    
+                    # 保存 __HISTORY__.json
+                    history_path = os.path.join(root_path, '__HISTORY__.json')
+                    history_data = {
+                        'order': episode_order,
+                        'path': video_path,
+                        'view-time': int(time.time()),
+                        'video-time': video_time
+                    }
+                    with open(history_path, 'w', encoding='utf-8') as f:
+                        json.dump(history_data, f, ensure_ascii=False, indent=2)
+                    
+                    print(f"[分类展示模块] 观看记录保存成功")
+                    success = True
+                except Exception as e:
+                    print(f"[分类展示模块] 保存观看记录失败: {e}")
+            
+            message = json.dumps({
+                'command': 'WATCH_RECORD_SAVED',
+                'widgetId': widget_id,
+                'success': success
+            }, ensure_ascii=False)
+            await websocket.send(message)
+
+        elif command == 'GET_DANMAKU_CONFIG':
+            widget_id = data.get('widgetId', '')
+            print("[分类展示模块] 收到获取弹幕配置请求")
+            # 获取弹幕配置，不存在则使用默认值
+            danmaku_config = self.config.get('video-config', {}).get('danmaku-config', {
+                'speed': 0.75,
+                'fontsizeScale': 1.0,
+                'area': 0.75
+            })
+            message = json.dumps({
+                'command': 'DANMAKU_CONFIG',
+                'widgetId': widget_id,
+                'danmakuConfig': danmaku_config
+            }, ensure_ascii=False)
+            await websocket.send(message)
+            print("[分类展示模块] 发送弹幕配置")
+
+        elif command == 'SET_DANMAKU_CONFIG':
+            widget_id = data.get('widgetId', '')
+            danmaku_config = data.get('danmakuConfig', {})
+            print(f"[分类展示模块] 收到设置弹幕配置请求: {danmaku_config}")
+            # 确保配置结构存在
+            if 'video-config' not in self.config:
+                self.config['video-config'] = {}
+            self.config['video-config']['danmaku-config'] = danmaku_config
+            # 保存配置
+            self.save_config()
+            message = json.dumps({
+                'command': 'DANMAKU_CONFIG_SAVED',
+                'widgetId': widget_id,
+                'success': True
+            }, ensure_ascii=False)
+            await websocket.send(message)
+            print("[分类展示模块] 弹幕配置保存成功")
+
+        else:
+            print(f"[分类展示模块] 收到未知命令: {command}")
+
+# 模块工厂函数，用于创建模块实例
+def create_module(global_config, back_version):
+    return ClassifyShowerModule(global_config)

@@ -1,0 +1,882 @@
+这个问题非常关键，因为“实时封装”这个词容易让人误解成：
+
+> 把 MKV 转成 MP4 文件，然后播放。
+
+实际上不是。
+
+**Local Agent 的职责 3，本质是一个实时的 `demux + mux + stream` 管线。**
+
+它做的是：
+
+```
+输入：
+任意容器文件
+
+      MKV
+       |
+       | 读取
+       ↓
+
+   解包(demux)
+
+       |
+       |
+       +------------+
+       |            |
+       ↓            ↓
+    H264包        AAC包
+
+
+       |
+       |
+       ↓
+
+   重新打包(mux)
+
+       |
+       ↓
+
+ fragmented MP4 流
+
+       |
+       ↓
+
+ HTTP Response
+
+       |
+       ↓
+
+ 浏览器 MSE
+
+       |
+       ↓
+
+ <video>
+```
+
+没有生成任何中间文件。
+
+---
+
+# 1. 先理解：为什么需要重新封装？
+
+比如一个 MKV：
+
+```
+movie.mkv
+
+Container:
+ Matroska
+
+Tracks:
+
+Track 1:
+ codec_id = V_MPEG4/ISO/AVC
+ H264
+
+Track 2:
+ codec_id = A_AAC
+ AAC
+
+```
+
+里面的视频数据：
+
+其实可能是：
+
+```
+00 00 00 01 67 ...
+00 00 00 01 68 ...
+00 00 00 01 65 ...
+```
+
+也就是 H264 NAL units。
+
+浏览器不是不会解码 H264。
+
+浏览器不会的是：
+
+```
+Matroska container
+```
+
+所以：
+
+```
+MKV
+ |
+ ❌ 浏览器不知道怎么拆
+```
+
+但是：
+
+```
+MP4/fMP4
+ |
+ ✅ 浏览器知道
+```
+
+所以 Agent 做：
+
+```
+MKV container
+       |
+       |
+      H264
+      AAC
+       |
+       |
+MP4 container
+```
+
+---
+
+# 2. Demux：拆开原始容器
+
+以 MKV 举例。
+
+MKV结构：
+
+```
+EBML Header
+
+Segment
+ |
+ +-- Info
+ |
+ +-- Tracks
+ |
+ +-- Cues
+ |
+ +-- Cluster
+       |
+       +-- SimpleBlock
+              |
+              |
+              H264 frame
+```
+
+Agent：
+
+调用：
+
+```
+libavformat
+```
+
+例如：
+
+```c
+AVFormatContext *fmt;
+
+avformat_open_input(
+    &fmt,
+    "movie.mkv",
+    NULL,
+    NULL
+);
+```
+
+FFmpeg 自动识别：
+
+```
+Input #0, matroska
+
+Stream #0:
+ Video: h264
+
+Stream #1:
+ Audio: aac
+```
+
+然后：
+
+循环读取：
+
+```c
+AVPacket pkt;
+
+while(av_read_frame(fmt,&pkt)>=0)
+{
+}
+```
+
+得到：
+
+视频：
+
+```
+pkt.stream_index=0
+
+pkt.data:
+
+H264 compressed frame
+```
+
+音频：
+
+```
+pkt.stream_index=1
+
+pkt.data:
+
+AAC compressed frame
+```
+
+注意：
+
+这里没有解码。
+
+只是：
+
+```
+拆盒子
+```
+
+所以速度非常快。
+
+---
+
+# 3. 为什么不能直接把 H264/AAC 发给浏览器？
+
+因为浏览器需要：
+
+```
+MP4 container
+```
+
+不是裸流：
+
+```
+H264
+AAC
+```
+
+例如：
+
+直接发送：
+
+```
+HTTP
+
+00 00 00 01 67
+00 00 00 01 65
+
+```
+
+浏览器：
+
+不知道：
+
+* 时间戳
+* 关键帧
+* 音视频对应关系
+
+所以需要 mux。
+
+---
+
+# 4. Mux：重新包装成 fMP4
+
+这里是核心。
+
+现代浏览器喜欢：
+
+```
+fragmented MP4
+```
+
+不是传统 MP4。
+
+结构：
+
+```
+ftyp
+
+moov
+
+moof
+mdat
+
+moof
+mdat
+
+moof
+mdat
+```
+
+解释：
+
+## ftyp
+
+告诉浏览器：
+
+```
+我是MP4
+```
+
+例如：
+
+```
+major_brand=isom
+```
+
+---
+
+## moov
+
+初始化信息：
+
+包含：
+
+```
+视频:
+
+codec=h264
+width=1920
+height=1080
+
+音频:
+
+aac
+48000Hz
+
+timescale
+
+track info
+```
+
+浏览器收到：
+
+知道：
+
+```
+后面来的数据是什么
+```
+
+---
+
+## moof + mdat
+
+真正的视频片段。
+
+例如：
+
+```
+moof
+ |
+ |-- sample 1
+ |-- sample 2
+
+
+mdat
+ |
+ |-- H264 frame
+ |-- H264 frame
+
+```
+
+通常：
+
+2秒一个 fragment。
+
+---
+
+# 5. Agent 怎么生成 fMP4？
+
+两种方式。
+
+---
+
+## 方法 A：使用 libavformat muxer
+
+这是最简单。
+
+创建输出：
+
+```c
+AVFormatContext *outctx;
+
+avformat_alloc_output_context2(
+    &outctx,
+    NULL,
+    "mp4",
+    NULL
+);
+```
+
+设置：
+
+```c
+movflags =
+frag_keyframe+empty_moov
+```
+
+意思：
+
+```
+不要生成普通MP4文件
+
+生成流式MP4
+```
+
+然后：
+
+输入 packet：
+
+```
+MKV H264 packet
+```
+
+直接：
+
+```
+av_interleaved_write_frame()
+```
+
+输出：
+
+```
+fMP4 bytes
+```
+
+---
+
+流程：
+
+```
+av_read_frame()
+
+        ↓
+
+AVPacket(H264)
+
+        ↓
+
+mp4 muxer
+
+        ↓
+
+moof+mdat
+
+        ↓
+
+socket
+```
+
+---
+
+## 方法 B：自己写 fMP4 muxer
+
+理论可行。
+
+因为你只需要：
+
+H264 + AAC。
+
+需要生成：
+
+```
+ftyp
+moov
+moof
+mdat
+```
+
+很多 Web 播放器会这么做。
+
+比如：
+
+* mp4box.js
+* mux.js
+
+---
+
+# 6. 怎么发送给浏览器？
+
+这里有两种模式。
+
+---
+
+# 模式 1：HTTP Streaming（最简单）
+
+浏览器：
+
+```javascript
+video.src =
+"http://localhost:8888/video/123"
+```
+
+Agent：
+
+返回：
+
+HTTP:
+
+```
+HTTP/1.1 200 OK
+
+Content-Type:
+video/mp4
+
+Transfer-Encoding:
+chunked
+
+```
+
+然后：
+
+不断发送：
+
+```
+chunk1:
+
+ftyp
+moov
+
+
+chunk2:
+
+moof
+mdat
+
+
+chunk3:
+
+moof
+mdat
+
+```
+
+浏览器收到：
+
+```
+MP4 stream
+```
+
+---
+
+但是：
+
+普通 `<video>` 不一定很好控制。
+
+更推荐：
+
+---
+
+# 模式 2：MSE（专业方案）
+
+浏览器：
+
+创建：
+
+```javascript
+const ms =
+new MediaSource();
+
+video.src =
+URL.createObjectURL(ms);
+```
+
+打开：
+
+```javascript
+sourceBuffer =
+ms.addSourceBuffer(
+'video/mp4; codecs="avc1.640028,mp4a.40.2"'
+);
+```
+
+然后：
+
+Agent：
+
+WebSocket:
+
+```
+binary data
+```
+
+发送：
+
+```
+moov
+
+moof+mdat
+
+moof+mdat
+
+```
+
+JS：
+
+收到：
+
+```javascript
+socket.onmessage=e=>{
+
+ sourceBuffer.appendBuffer(
+    e.data
+ );
+
+}
+```
+
+于是：
+
+```
+Agent
+
+ ↓
+
+WebSocket
+
+ ↓
+
+MSE Buffer
+
+ ↓
+
+video decoder
+
+ ↓
+
+GPU
+
+```
+
+---
+
+# 7. Seek 怎么办？
+
+比如用户拖到：
+
+```
+50分钟
+```
+
+浏览器：
+
+发送：
+
+```
+seek 3000s
+```
+
+Agent：
+
+不是从头读。
+
+它：
+
+读取：
+
+```
+MKV Cues
+```
+
+找到：
+
+```
+timestamp=3000
+
+offset=534234234
+```
+
+然后：
+
+```
+seek(file)
+```
+
+重新生成：
+
+```
+moov
+
+moof
+mdat
+
+```
+
+发送。
+
+---
+
+# 8. 延迟是多少？
+
+因为：
+
+没有编码。
+
+只有：
+
+```
+读取
++
+解析
++
+封装
+```
+
+速度非常快。
+
+例如：
+
+一个：
+
+```
+20GB MKV
+H264
+```
+
+播放：
+
+CPU消耗可能：
+
+```
+<5%
+```
+
+因为真正耗CPU的是：
+
+```
+H264 decode
+```
+
+而 decode 在：
+
+```
+浏览器 GPU
+```
+
+完成。
+
+---
+
+# 9. Agent 实际代码架构大概这样
+
+```
+             HTTP/WebSocket Server
+
+                      |
+                      |
+
+                 Stream Manager
+
+                      |
+
+              +---------------+
+              |               |
+
+          Demuxer          Muxer
+
+              |               |
+
+          libavformat    MP4 mux
+
+              |
+
+           filesystem
+
+
+```
+
+线程：
+
+```
+Thread 1:
+读取文件
+
+
+Thread 2:
+demux
+
+
+Thread 3:
+mux
+
+
+Thread 4:
+网络发送
+
+```
+
+---
+
+# 10. 和 FFmpeg 转换最大的区别
+
+传统：
+
+```
+ffmpeg input.mkv output.mp4
+
+时间：
+几十分钟
+
+结果：
+生成文件
+```
+
+Local Agent：
+
+```
+open input.mkv
+
+read 2秒数据
+
+生成2秒fMP4
+
+发送
+
+丢弃buffer
+```
+
+生命周期：
+
+```
+buffer
+
+创建
+ ↓
+发送
+ ↓
+释放
+```
+
+磁盘：
+
+```
+0增加
+```
+
+---
+
+# 对你的文件整理 WebApp，我会采用这个具体组合：
+
+```
+Browser
+
+MSE Player
+ |
+WebSocket
+ |
+Local Agent
+
+ |
+libavformat
+ |
+MKV/MOV/TS parser
+
+ |
+fMP4 muxer
+
+ |
+filesystem
+```
+
+这实际上就是：
+
+**把 VLC/mpv 的“读取和解析能力”搬到浏览器旁边，把 Chrome 的“解码能力”继续利用起来。**
+
+这是目前最接近“Web版资源管理器 + 万能视频预览”的架构。

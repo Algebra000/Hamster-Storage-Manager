@@ -1,0 +1,12 @@
+{
+    "modules": {
+        "treemap": {
+            "enabled": true,
+            "path": "treemap_back"
+        },
+        "classify_shower": {
+            "enabled": true,
+            "path": "classify_shower_back"
+        }
+    }
+}

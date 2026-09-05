@@ -1,0 +1,34 @@
+{
+  "custom-class": {
+    "video": {
+      "知识星球": [
+        {
+          "name": "视频课程",
+          "have_poster": false
+        },
+        {
+          "name": "英文资源"
+        }
+      ]
+    },
+    "picture": {}
+  },
+  "video-config": {
+    "danmaku-config": {
+      "speed": 0.75,
+      "fontsizeScale": 1.0,
+      "area": 1
+    },
+    "ffmpeg-path": "C:/Tools/ffmpeg.exe",
+    "comment-config": {
+      "page-size": 10,
+      "sort-by": "time",
+      "mark-deleted": false,
+      "only-deleted": false,
+      "only-vip": false,
+      "word-filter-enabled": false,
+      "word-count": 100,
+      "word-direction": "above"
+    }
+  }
+}

@@ -49,8 +49,8 @@ class ModuleManager:
     
     def load_modules(self):
         """加载模块"""
-        # 加载 model_config.json
-        model_config_path = os.path.join(script_dir, 'config', 'model_config.json')
+        # 加载 module_config.json
+        model_config_path = os.path.join(script_dir, 'config', 'module_config.json')
         if os.path.exists(model_config_path) and os.path.isfile(model_config_path):
             try:
                 with open(model_config_path, 'r', encoding='utf-8') as f:

@@ -4,6 +4,7 @@
 back.png
 icon.ico
 install.bat
+install.py
 MainUI.html
 start.bat
 
@@ -13,8 +14,7 @@ backend\treemap_back.py
 backend\classify_shower\pinyin.txt
 backend\config\classify_shower_config.json
 backend\config\file_type.py
-backend\config\global_config.json
-backend\config\model_config.json
+backend\config\module_config.json
 backend\config\treemap_config.json
 
 frontend\classify_shower_video.js

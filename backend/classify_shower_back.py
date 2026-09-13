@@ -2368,7 +2368,7 @@ class ClassifyShowerModule:
 
     @staticmethod
     def inspect_comment_database(database_path):
-        """从 v1.1 数据库读取来源元数据以及 main/reply 的精确行数。"""
+        """读取来源元数据、评论数（main + top）以及回复数（reply）。"""
         path = Path(database_path).resolve()
         connection = _open_comment_database_readonly(path)
         try:
@@ -2385,6 +2385,10 @@ class ClassifyShowerModule:
             comment_count = int(connection.execute(
                 'SELECT COUNT(*) FROM main'
             ).fetchone()[0])
+            if 'top' in tables:
+                comment_count += int(connection.execute(
+                    'SELECT COUNT(*) FROM "top"'
+                ).fetchone()[0])
             reply_count = int(connection.execute(
                 'SELECT COUNT(*) FROM reply'
             ).fetchone()[0])

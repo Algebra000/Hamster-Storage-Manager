@@ -1340,7 +1340,7 @@ def merge_delta_into_deletelist(update_dir: Path, file_name: str,
 
 
 def comment_database_counts(database_path: Path) -> tuple:
-    """按构建标准返回最终合并库 main、reply 两张表的行数。"""
+    """返回最终合并库评论数（main + top）和回复数（reply）。"""
     database_path = Path(database_path)
     connection = open_sqlite_database_readonly(database_path)
     try:
@@ -1348,6 +1348,12 @@ def comment_database_counts(database_path: Path) -> tuple:
         comment_count = connection.execute(
             'SELECT COUNT(*) FROM "main"'
         ).fetchone()[0]
+        if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='top'"
+        ).fetchone():
+            comment_count += connection.execute(
+                'SELECT COUNT(*) FROM "top"'
+            ).fetchone()[0]
         reply_count = connection.execute(
             'SELECT COUNT(*) FROM "reply"'
         ).fetchone()[0]

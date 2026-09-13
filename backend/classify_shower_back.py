@@ -1,5 +1,6 @@
 # classify_shower_back.py - 分类展示模块的后端实现，适用于 ROLAND 版本的仓鼠存储管理器。
 import os
+import html
 import asyncio
 import datetime
 import json
@@ -632,6 +633,75 @@ def parse_layers(layers_data, base_width, base_height,
     return result
 
 
+def render_comment_message(content, resource_root, basic_resource_folder):
+    """只扫描原始正文一次；生成的标签不再参与表情、关键词替换。"""
+    message = str(content.get("message", "") or "")
+    replacements = {}
+    for key, data in (content.get("emote", {}) or {}).items():
+        if not key:
+            continue
+        src = remap_url_to_absolute(
+            data.get("url", ""), resource_root, basic_resource_folder,
+        )
+        if not src:
+            continue
+        size = (data.get("meta", {}) or {}).get("size", 1)
+        style = ""
+        if size != 1:
+            pixels = 25 * int(size)
+            style = f' style="max-width: {pixels}px; max-height: {pixels}px;"'
+        replacements[key] = (
+            f'<img src="{html.escape(src, quote=True)}" '
+            f'alt="{html.escape(key, quote=True)}" '
+            f'title="{html.escape(str(data.get("text", "")), quote=True)}"{style}>'
+        )
+
+    for key, data in (content.get("jump_url", {}) or {}).items():
+        if not key:
+            continue
+        icon = remap_url_to_absolute(
+            data.get("prefix_icon", ""), resource_root, basic_resource_folder,
+        )
+        title = data.get("title", "")
+        position = data.get("icon_position", 0)
+        # 保留原来的图标、标题以及前置/后置图标显示条件。
+        if not icon or not title or position not in (0, 1):
+            continue
+        href = str(data.get("pc_url", "") or key)
+        if href.startswith("//"):
+            href = "https:" + href
+        title_html = html.escape(str(title))
+        icon_src = html.escape(icon, quote=True)
+        if position == 0:
+            body = f'<img src="{icon_src}" alt="链接" width="18" height="18">{title_html}'
+        else:
+            body = (
+                f'{title_html}<img src="{icon_src}" alt="链接" '
+                'style="max-width: 18px; max-height: 18px; margin: 0px;">'
+            )
+        replacements[key] = (
+            f'<a href="{html.escape(href, quote=True)}" '
+            f'class="cs-cmt-v1-jump-link" target="_blank">{body}</a>'
+        )
+
+    if not replacements:
+        return html.escape(message)
+
+    # 同一位置优先最长匹配：完整链接优先于其中的 share 等短关键词。
+    # finditer 始终读取原始 message，绝不会扫描刚生成的 href/src/title。
+    pattern = re.compile("|".join(
+        re.escape(key) for key in sorted(replacements, key=len, reverse=True)
+    ))
+    parts = []
+    cursor = 0
+    for match in pattern.finditer(message):
+        parts.append(html.escape(message[cursor:match.start()]))
+        parts.append(replacements[match.group(0)])
+        cursor = match.end()
+    parts.append(html.escape(message[cursor:]))
+    return "".join(parts)
+
+
 def comment_to_comment_html(comment, resource_root, basic_resource_folder,
                             mark_deleted=False):
     '''
@@ -676,57 +746,11 @@ def comment_to_comment_html(comment, resource_root, basic_resource_folder,
         resource_root, basic_resource_folder,
     )
 
-    message = content.get("message", "")
-    emotes = content.get("emote", {}) or {}
-    jump_url = content.get("jump_url", {}) or {}
     pictures = content.get("pictures", []) or []
+    message_html = render_comment_message(
+        content, resource_root, basic_resource_folder,
+    )
 
-    message_html = message
-    for emote_key, emote_data in emotes.items():
-        emote_url = remap_url_to_absolute(
-            emote_data.get("url", ""),
-            resource_root, basic_resource_folder,
-        )
-        emote_meta = emote_data.get("meta", {}) or {}
-        emote_size = emote_meta.get("size", 1)
-        if emote_url:
-            if emote_size == 1:
-                message_html = message_html.replace(
-                    emote_key,
-                    f'<img src="{emote_url}" alt="{emote_key}" title="{emote_data.get("text", "")}">'
-                )
-            else:
-                max_width = 25*int(emote_size)
-                max_height = max_width
-                message_html = message_html.replace(
-                    emote_key,
-                    f'<img src="{emote_url}" alt="{emote_key}" title="{emote_data.get("text", "")}" style="max-width: {max_width}px; max-height: {max_height}px;">'
-                )
-
-    for url, url_data in jump_url.items():
-        prefix_icon = remap_url_to_absolute(
-            url_data.get("prefix_icon", ""),
-            resource_root, basic_resource_folder,
-        )
-        title = url_data.get("title", "")
-        pc_url = url_data.get("pc_url", "")
-        icon_position = url_data.get("icon_position", 0)
-        if pc_url.startswith("//"):
-            pc_url = "https:" + pc_url
-        if pc_url:
-            if prefix_icon and title and icon_position == 0:
-                jump_html = f'<a href="{pc_url}" class="cs-cmt-v1-jump-link" target="_blank"><img src="{prefix_icon}" alt="链接" width="18" height="18">{title}</a>'
-                message_html = message_html.replace(url, jump_html)
-            elif prefix_icon and title and icon_position == 1:
-                jump_html = f'<a href="{pc_url}" class="cs-cmt-v1-jump-link" target="_blank">{title}<img src="{prefix_icon}" alt="链接" style="max-width: 18px; max-height: 18px; margin: 0px;"></a>'
-                message_html = message_html.replace(url, jump_html)
-        else:
-            if prefix_icon and title and icon_position == 0:
-                jump_html = f'<a href="{url}" class="cs-cmt-v1-jump-link" target="_blank"><img src="{prefix_icon}" alt="链接" width="18" height="18">{title}</a>'
-                message_html = message_html.replace(url, jump_html)
-            elif prefix_icon and title and icon_position == 1:
-                jump_html = f'<a href="{url}" class="cs-cmt-v1-jump-link" target="_blank">{title}<img src="{prefix_icon}" alt="链接" style="max-width: 18px; max-height: 18px; margin: 0px;"></a>'
-                message_html = message_html.replace(url, jump_html)
 
     pictures_html = ""
     all_srcs = [
@@ -856,57 +880,11 @@ def comment_to_comment_html(comment, resource_root, basic_resource_folder,
                 resource_root, basic_resource_folder,
             )
 
-            reply_message = reply_content.get("message", "")
-            reply_emotes = reply_content.get("emote", {}) or {}
-            reply_jump_url = reply_content.get("jump_url", {}) or {}
             reply_pictures = reply_content.get("pictures", []) or []
+            reply_message_html = render_comment_message(
+                reply_content, resource_root, basic_resource_folder,
+            )
 
-            reply_message_html = reply_message
-            for emote_key, emote_data in reply_emotes.items():
-                emote_url = remap_url_to_absolute(
-                    emote_data.get("url", ""),
-                    resource_root, basic_resource_folder,
-                )
-                emote_meta = emote_data.get("meta", {}) or {}
-                emote_size = emote_meta.get("size", 1)
-                if emote_url:
-                    if emote_size == 1:
-                        reply_message_html = reply_message_html.replace(
-                            emote_key,
-                            f'<img src="{emote_url}" alt="{emote_key}" title="{emote_data.get("text", "")}">'
-                        )
-                    else:
-                        max_width = 25*int(emote_size)
-                        max_height = max_width
-                        reply_message_html = reply_message_html.replace(
-                            emote_key,
-                            f'<img src="{emote_url}" alt="{emote_key}" title="{emote_data.get("text", "")}" style="max-width: {max_width}px; max-height: {max_height}px;">'
-                        )
-
-            for url, url_data in reply_jump_url.items():
-                prefix_icon = remap_url_to_absolute(
-                    url_data.get("prefix_icon", ""),
-                    resource_root, basic_resource_folder,
-                )
-                title = url_data.get("title", "")
-                pc_url = url_data.get("pc_url", "")
-                icon_position = url_data.get("icon_position", 0)
-                if pc_url.startswith("//"):
-                    pc_url = "https:" + pc_url
-                if pc_url:
-                    if prefix_icon and title and icon_position == 0:
-                        jump_html = f'<a href="{pc_url}" class="cs-cmt-v1-jump-link" target="_blank"><img src="{prefix_icon}" alt="链接" width="18" height="18">{title}</a>'
-                        reply_message_html = reply_message_html.replace(url, jump_html)
-                    elif prefix_icon and title and icon_position == 1:
-                        jump_html = f'<a href="{pc_url}" class="cs-cmt-v1-jump-link" target="_blank">{title}<img src="{prefix_icon}" alt="链接" style="max-width: 18px; max-height: 18px; margin: 0px;"></a>'
-                        reply_message_html = reply_message_html.replace(url, jump_html)
-                else:
-                    if prefix_icon and title and icon_position == 0:
-                        jump_html = f'<a href="{url}" class="cs-cmt-v1-jump-link" target="_blank"><img src="{prefix_icon}" alt="链接" width="18" height="18">{title}</a>'
-                        reply_message_html = reply_message_html.replace(url, jump_html)
-                    elif prefix_icon and title and icon_position == 1:
-                        jump_html = f'<a href="{url}" class="cs-cmt-v1-jump-link" target="_blank">{title}<img src="{prefix_icon}" alt="链接" style="max-width: 18px; max-height: 18px; margin: 0px;"></a>'
-                        reply_message_html = reply_message_html.replace(url, jump_html)
 
             reply_pictures_html = ""
             reply_all_srcs = [

@@ -691,3 +691,6 @@ class TreemapModule:
 # 模块工厂函数，用于创建模块实例
 def create_module(global_config, back_version):
     return TreemapModule(global_config)
+
+def settings():
+    pass

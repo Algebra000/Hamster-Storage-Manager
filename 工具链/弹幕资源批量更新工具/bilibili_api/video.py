@@ -904,9 +904,11 @@ class Video:
 
         # *^X^* 以下为更改部分        
             elif type_ == 14:
-                 reader.bytes_string()
+                reader.bytes_string()
             elif type_ == 17:#错误号 2026-07-23-E01
-                 reader.bytes_string()
+                reader.bytes_string()
+            elif type_ == 18:#错误号 2026-09-17-E01
+                reader.bytes_string()
             elif type_ == 20:#错误号 2026-07-23-E02
                 reader.bytes_string()#风险信息，可能含auth_key字符串
         ########################

@@ -1,6 +1,8 @@
 import os
 import json
 import time
+import importlib
+import sys
 
 
 def show_base_dir(path_list):
@@ -68,7 +70,32 @@ def set_all_module(mods):
     设置所有模块的配置
     mods: 所有已安装模块的列表，每个元素是一个元组: (module_name, module_info)
     """
-    pass
+    backend_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backend")
+    original_dir = os.getcwd()
+    original_sys_path = sys.path[:]
+    try:
+        # 与后端运行时保持一致，支持模块导入 config 及使用相对配置路径。
+        sys.path.insert(0, backend_dir)
+        for module_name, module_info in mods:
+            try:
+                os.chdir(backend_dir)
+                module_path = module_info.get("path")
+                if not isinstance(module_path, str) or not module_path.strip():
+                    print(f"跳过模块 {module_name}：未配置有效的 path。")
+                    continue
+                module = importlib.import_module(module_path.replace('/', '.'))
+                settings = getattr(module, "settings", None)
+                if not callable(settings):
+                    print(f"跳过模块 {module_name}：没有可调用的配置函数。")
+                    continue
+                print(f"\n开始配置模块 {module_name}：")
+                settings()
+                print(f"模块 {module_name} 配置完成。")
+            except Exception as e:
+                print(f"模块 {module_name} 配置失败：{e}")
+    finally:
+        os.chdir(original_dir)
+        sys.path[:] = original_sys_path
 
 
 print("欢迎安装仓鼠存储管理器\n")

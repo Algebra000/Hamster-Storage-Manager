@@ -113,8 +113,6 @@ if os.path.exists("./backend/config/global_config.json"):
         print("检测到已有配置文件，成功加载配置文件。")
         print("首先我们先设置要管理的资源目录有哪些，管理器将管理这些目录下的所有文件和文件夹。")
         show_base_dir(path_list)
-        while edit_base_dir(path_list):
-            time.sleep(2)
 
     except Exception as e:
         print(f"加载配置文件时出错：{e}")

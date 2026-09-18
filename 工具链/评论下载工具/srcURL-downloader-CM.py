@@ -10,6 +10,7 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
+import sys
 
 import aiohttp.client_exceptions
 import aiohttp.http_exceptions as aiohttp_http_exceptions
@@ -395,6 +396,12 @@ class StreamingCommentDatabaseWriter:
                 "FOREIGN KEY(member) REFERENCES member(parent),"
                 "FOREIGN KEY(content) REFERENCES content(parent))"
             )
+        # 三张评论表共享 rpid；临时唯一索引也覆盖没有 member/content 的评论。
+        # 仅用于本次流式写入，不改变最终数据库的 v1.1 格式。
+        self.connection.execute(
+            'CREATE TEMP TABLE _written_comments('
+            'rpid INTEGER PRIMARY KEY, table_name TEXT NOT NULL)'
+        )
         self.connection.commit()
 
     def _ensure_comment_columns(self, comment_dict: dict):
@@ -456,8 +463,64 @@ class StreamingCommentDatabaseWriter:
         return stable_hash(values)
 
     def _insert_comment(self, table_name: str, comment_dict: dict):
-        self._ensure_comment_columns(comment_dict)
         rpid = comment_rpid(comment_dict)
+        # 列扩展放在保存点外，回滚单条写入时保持列缓存与实际表结构一致。
+        self._ensure_comment_columns(comment_dict)
+        for entity in ("member", "content"):
+            data = comment_dict.get(entity)
+            if isinstance(data, dict):
+                self._ensure_entity_columns(entity, data)
+        # 保存点必须嵌套在页事务内，否则 RELEASE 会逐条提交。
+        if not self.connection.in_transaction:
+            self.connection.execute("BEGIN")
+        self.connection.execute("SAVEPOINT insert_comment")
+        registering = True
+        try:
+            # 正常路径直接 INSERT，由 SQLite 唯一约束检测重复，不预先 SELECT。
+            self.connection.execute(
+                'INSERT INTO temp._written_comments VALUES(?,?)', (rpid, table_name)
+            )
+            registering = False
+            self._insert_comment_rows(table_name, comment_dict, rpid)
+        except Exception as error:
+            self.connection.execute("ROLLBACK TO insert_comment")
+            self.connection.execute("RELEASE insert_comment")
+            # 只恢复 ID 登记表的主键冲突，实体/评论的其他约束错误照常抛出。
+            # Python 3.8 没有 sqlite_errorcode；精确匹配表和列，兼容旧版 sqlite3。
+            if not (registering and isinstance(error, sqlite3.IntegrityError)
+                    and str(error) == "UNIQUE constraint failed: _written_comments.rpid"):
+                raise
+            existing = self.connection.execute(
+                'SELECT table_name FROM temp._written_comments WHERE rpid=?', (rpid,)
+            ).fetchone()
+            if existing is None:
+                raise
+            if table_name == "top" and existing[0] == "main":
+                # 后续页才出现的置顶项只移动分类，保留同一组实体与回复。
+                self.connection.execute("SAVEPOINT promote_comment")
+                try:
+                    self.connection.execute(
+                        'INSERT INTO top SELECT * FROM main WHERE rpid=?', (rpid,)
+                    )
+                    self.connection.execute('DELETE FROM main WHERE rpid=?', (rpid,))
+                    self.connection.execute(
+                        "UPDATE temp._written_comments SET table_name='top' WHERE rpid=?",
+                        (rpid,),
+                    )
+                except Exception:
+                    self.connection.execute("ROLLBACK TO promote_comment")
+                    raise
+                finally:
+                    self.connection.execute("RELEASE promote_comment")
+                self.main_count -= 1
+                self.top_count += 1
+            return False
+        else:
+            self.connection.execute("RELEASE insert_comment")
+            return True
+
+    def _insert_comment_rows(self, table_name: str, comment_dict: dict, rpid: int):
+        """在调用方的保存点内写入实体及评论。"""
         kind = "reply" if table_name == "reply" else "main"
         member_ref = self._insert_entity(
             "member", rpid, kind, comment_dict.get("member")
@@ -487,28 +550,26 @@ class StreamingCommentDatabaseWriter:
 
     def write_main_comment(self, comment_dict: dict):
         """写入一条主评论及其回复；对象不会被写库器长期持有。"""
-        self._insert_comment("main", comment_dict)
+        inserted = self._insert_comment("main", comment_dict)
         reply_count = 0
         for reply in iter_nested_replies(comment_dict):
-            self._insert_comment("reply", reply)
-            reply_count += 1
+            reply_count += int(self._insert_comment("reply", reply))
         encoded = compact_json(comment_dict, sort_keys=True).encode("utf-8")
         self.source_hasher.update(len(encoded).to_bytes(8, "big"))
         self.source_hasher.update(encoded)
-        self.main_count += 1
+        self.main_count += int(inserted)
         self.reply_count += reply_count
 
     def write_top_comment(self, comment_dict: dict):
         """写入一条置顶评论及其回复；置顶评论不重复写入 main。"""
-        self._insert_comment("top", comment_dict)
+        inserted = self._insert_comment("top", comment_dict)
         reply_count = 0
         for reply in iter_nested_replies(comment_dict):
-            self._insert_comment("reply", reply)
-            reply_count += 1
+            reply_count += int(self._insert_comment("reply", reply))
         encoded = compact_json(comment_dict, sort_keys=True).encode("utf-8")
         self.source_hasher.update(len(encoded).to_bytes(8, "big"))
         self.source_hasher.update(encoded)
-        self.top_count += 1
+        self.top_count += int(inserted)
         self.reply_count += reply_count
 
     def commit_page(self):
@@ -1869,6 +1930,8 @@ async def download_comment_database(bvid: str, output_path: Path,
             if is_last_page:
                 break
         database_writer.finalize()
+        total_comments = database_writer.main_count
+        total_top_comments = database_writer.top_count
     print(
         f"{bvid} 评论下载完成，共 {total_comments} 条主评论，"
         f"{total_top_comments} 条置顶评论"
@@ -2125,4 +2188,6 @@ async def main():
 
 
 if __name__ == "__main__":
+    print("实际解释器：", sys.executable)
+    print("Python 版本：", sys.version)
     asyncio.run(main())

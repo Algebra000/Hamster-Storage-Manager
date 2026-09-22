@@ -12,6 +12,13 @@ from pathlib import Path
 from typing import List, Dict, Optional
 import time
 import uuid
+import platform
+from http.client import HTTPException
+import shutil
+import tarfile
+import tempfile
+import zipfile
+from urllib.request import Request, urlopen
 
 # 导入文件类型列表
 from config.file_type import video_type_list
@@ -3059,5 +3066,195 @@ class ClassifyShowerModule:
 def create_module(global_config, back_version):
     return ClassifyShowerModule(global_config)
 
+def classify_shower_check_ffmpeg(ffmpeg_path: str):
+    """返回 (是否可用, 说明)，检测组件并实际执行视频复制、音频转码及管道输出。
+
+    不要求视频编码器：播放器只复制视频。微型 H.264 样本是一帧 16x16
+    黑色视频（SPS/PPS/IDR），检测过程不读取用户媒体，也不使用 ffprobe。
+    """
+    def run(arguments, payload=None):
+        result = subprocess.run(
+            [ffmpeg_path, '-hide_banner', '-nostdin'] + arguments,
+            input=payload, stdin=subprocess.DEVNULL if payload is None else None,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        if result.returncode:
+            raise ValueError(result.stderr.decode('utf-8', errors='replace')[-1500:]
+                             or f'FFmpeg 返回 {result.returncode}')
+        return result.stdout
+
+    try:
+        if not isinstance(ffmpeg_path, str) or not os.path.isfile(ffmpeg_path):
+            return False, '可执行文件不存在'
+        version = run(['-version']).decode('utf-8', errors='replace').splitlines()
+        if not version or not version[0].startswith('ffmpeg version '):
+            return False, '该文件不是 FFmpeg'
+
+        # 按组件名称而非描述判断，兼容同一解码器的整数/浮点实现。
+        demuxers = run(['-demuxers']).decode('utf-8', errors='replace')
+        available = set()
+        for line in demuxers.splitlines():
+            match = re.match(r'\s*D\s+(\S+)\s', line)
+            if match:
+                available.update(match.group(1).split(','))
+        missing = {'mov', 'matroska', 'avi', 'mpegts', 'mpeg', 'flv', 'asf', 'ogg', 'rm'} - available
+        if missing:
+            return False, '缺少容器读取支持：' + ', '.join(sorted(missing))
+        decoders = run(['-decoders']).decode('utf-8', errors='replace')
+        available = set(re.findall(r'^\s*A[.A-Z]{5}\s+(\S+)', decoders, re.MULTILINE))
+        for alternatives in ({'aac', 'aac_fixed'}, {'mp3', 'mp3float'}, {'ac3', 'ac3_fixed'},
+                             {'opus', 'libopus'}, {'amrnb', 'libopencore_amrnb'},
+                             {'amrwb', 'libopencore_amrwb'}, {'pcm_s16le'}):
+            if not alternatives & available:
+                return False, '缺少音频解码器：' + '/'.join(sorted(alternatives))
+
+        with tempfile.TemporaryDirectory(prefix='classify-ffmpeg-check-') as temp:
+            video = Path(temp) / 'sample.h264'
+            video.write_bytes(bytes.fromhex(
+                '000000016742c00ad91ec044000003000400000300123c489920'
+                '0000000168cb83cb200000000165888404bc98a00038a380'))
+            inputs = ['-loglevel', 'error', '-r', '2', '-i', str(video), '-f', 's16le',
+                      '-ar', '8000', '-ac', '1', '-i', 'pipe:0',
+                      '-map', '0:v:0', '-map', '1:a:0', '-sn', '-dn', '-c:v', 'copy',
+                      '-c:a', 'aac', '-profile:a', 'aac_low', '-ar:a', '48000', '-b:a', '128k']
+            fragments = ['-avoid_negative_ts', 'make_zero', '-movflags',
+                         'frag_keyframe+empty_moov+default_base_moof+delay_moov',
+                         '-frag_duration', '2000000', '-f', 'mp4', 'pipe:1']
+            # Seek 探测使用 debug_ts 和 null 输出，不要求解码/重新编码视频。
+            run(['-loglevel', 'info', '-debug_ts', '-i', str(video),
+                 '-map', '0:v:0', '-an', '-c', 'copy', '-frames:v', '1',
+                 '-f', 'null', 'pipe:1'])
+            # 8 kHz PCM -> 48 kHz AAC-LC；H.264 保持流复制。
+            output = run(inputs + fragments, b'\0' * 8000)
+            for marker in (b'ftyp', b'moov', b'avcC', b'esds', b'moof', b'mdat'):
+                if marker not in output:
+                    return False, 'fMP4 管道输出不完整：缺少 ' + marker.decode()
+            # 模拟 TS/ADTS AAC 输入，验证播放器的 aac_adtstoasc 复制路径。
+            transport = run(inputs + ['-f', 'mpegts', 'pipe:1'], b'\0' * 8000)
+            output = run(['-loglevel', 'error', '-f', 'mpegts', '-i', 'pipe:0',
+                          '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy',
+                          '-bsf:a', 'aac_adtstoasc'] + fragments, transport)
+            if not all(marker in output for marker in (b'avcC', b'esds', b'moof', b'mdat')):
+                return False, 'TS/AAC 重封装输出不完整'
+        return True, version[0]
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+
+
+def classify_shower_download_ffmpeg() -> str:
+    """下载普通静态构建，验证后安装到本模块 config/use/ffmpeg 目录。"""
+    system, machine = platform.system(), platform.machine().lower()
+    # 来源均列于 https://ffmpeg.org/download.html 。不用系统包管理器或管理员权限。
+    if system == 'Windows' and machine in ('amd64', 'x86_64'):
+        url = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
+    elif system == 'Linux' and machine in ('amd64', 'x86_64', 'aarch64', 'arm64'):
+        architecture = 'linux64' if machine in ('amd64', 'x86_64') else 'linuxarm64'
+        url = ('https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/'
+               f'ffmpeg-master-latest-{architecture}-gpl.tar.xz')
+    elif system == 'Darwin' and machine in ('amd64', 'x86_64'):
+        url = 'https://evermeet.cx/ffmpeg/getrelease/zip'
+    else:
+        raise ValueError(f'暂不支持自动下载 {system}/{machine} 构建，请手动准备本平台的 FFmpeg')
+
+    destination = Path(__file__).resolve().parent / 'config' / 'use' / 'ffmpeg'
+    destination.mkdir(parents=True, exist_ok=True)
+    executable_name = 'ffmpeg.exe' if system == 'Windows' else 'ffmpeg'
+    print(f'正在下载 FFmpeg：{url}，请稍候……')
+    with tempfile.TemporaryDirectory(prefix='download-', dir=destination) as temp:
+        archive = Path(temp) / 'archive'
+        request = Request(url, headers={'User-Agent': 'HamsterStorageManager/1.0'})
+        with urlopen(request, timeout=60) as response, archive.open('wb') as target:
+            shutil.copyfileobj(response, target)
+        executable = Path(temp) / executable_name
+        # 只读取目标二进制到固定路径，不按压缩包中的路径解压（避免路径穿越/符号链接）。
+        if zipfile.is_zipfile(archive):
+            with zipfile.ZipFile(archive) as package:
+                members = [m for m in package.infolist()
+                           if not m.is_dir() and m.filename.split('/')[-1] == executable_name]
+                if len(members) != 1:
+                    raise ValueError('下载包中没有唯一的 FFmpeg 可执行文件')
+                with package.open(members[0]) as source, executable.open('wb') as target:
+                    shutil.copyfileobj(source, target)
+        else:
+            with tarfile.open(archive, 'r:*') as package:
+                members = [m for m in package.getmembers()
+                           if m.isfile() and m.name.split('/')[-1] == executable_name]
+                if len(members) != 1:
+                    raise ValueError('下载包中没有唯一的 FFmpeg 可执行文件')
+                with package.extractfile(members[0]) as source, executable.open('wb') as target:
+                    shutil.copyfileobj(source, target)
+        executable.chmod(0o755)
+        valid, reason = classify_shower_check_ffmpeg(str(executable))
+        if not valid:
+            raise ValueError('下载的 FFmpeg 不可用：' + reason)
+        installed = destination / executable_name
+        os.replace(executable, installed)
+    return str(installed)
+
+
 def settings():
-    pass
+    """安装向导：依次检查配置、PATH、用户输入或下载的 FFmpeg，并保存路径。"""
+    backend_dir = Path(__file__).resolve().parent
+    config_path = backend_dir / 'config' / 'classify_shower_config.json'
+    try:
+        with config_path.open('r', encoding='utf-8') as file:
+            config = json.load(file)
+    except FileNotFoundError:
+        config = {'custom-class': {}, 'video-config': {
+            'danmaku-config': {}, 'ffmpeg-path': '', 'comment-config': {}}}
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with config_path.open('x', encoding='utf-8') as file:
+            json.dump(config, file, ensure_ascii=False, indent=2)
+    # 损坏的配置明确报错，不覆盖用户已有的分类、弹幕或评论配置。
+    if not isinstance(config, dict):
+        raise ValueError('classify_shower_config.json 的根节点必须是对象')
+    video_config = config.setdefault('video-config', {})
+    if not isinstance(video_config, dict):
+        raise ValueError('video-config 必须是对象')
+
+    def check_path(value):
+        if not isinstance(value, str) or not value.strip():
+            return None
+        value = os.path.expandvars(os.path.expanduser(value.strip().strip('"').strip("'")))
+        try:
+            path = Path(value)
+            if not path.is_absolute():
+                path = backend_dir / path
+            path = str(path.resolve())
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(f'路径无效：{exc}')
+            return None
+        print(f'正在验证 FFmpeg：{path}')
+        valid, reason = classify_shower_check_ffmpeg(path)
+        print(('验证通过：' if valid else '验证失败：') + reason)
+        return path if valid else None
+
+    ffmpeg_path = check_path(video_config.get('ffmpeg-path'))
+    if not ffmpeg_path:
+        system_path = shutil.which('ffmpeg')
+        if system_path:
+            ffmpeg_path = check_path(os.path.abspath(system_path))
+    while not ffmpeg_path:
+        value = input('请输入 FFmpeg 可执行文件路径，或直接回车下载普通版（Ctrl+C 取消）：').strip()
+        if value:
+            ffmpeg_path = check_path(value)
+        else:
+            try:
+                ffmpeg_path = classify_shower_download_ffmpeg()
+            except (OSError, ValueError, EOFError, HTTPException, tarfile.TarError, zipfile.BadZipFile) as exc:
+                print(f'下载失败：{exc}，请重试或输入已有可执行文件路径。')
+
+    video_config['ffmpeg-path'] = ffmpeg_path
+    # 原子替换，避免保存中断时留下半个 JSON 文件。
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=config_path.parent,
+                                         suffix='.tmp', delete=False) as file:
+            temporary_path = Path(file.name)
+            json.dump(config, file, ensure_ascii=False, indent=2)
+            file.write('\n')
+        os.replace(temporary_path, config_path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+    print(f'FFmpeg 已配置：{ffmpeg_path}')

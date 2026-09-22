@@ -677,6 +677,8 @@ def render_comment_message(content, resource_root, basic_resource_folder):
         href = str(data.get("pc_url", "") or key)
         if href.startswith("//"):
             href = "https:" + href
+        elif href.startswith("BV"):
+            href = "https://www.bilibili.com/video/" + href
         title_html = html.escape(str(title))
         icon_src = html.escape(icon, quote=True)
         if position == 0:

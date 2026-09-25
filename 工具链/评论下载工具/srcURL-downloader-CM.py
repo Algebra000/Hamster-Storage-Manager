@@ -1219,13 +1219,20 @@ async def download_comment_resources(resource_urls: dict, base_path: Path,
     for category in COMMENT_RESOURCE_TYPES:
         category_path = base_path / category
         category_path.mkdir(parents=True, exist_ok=True)
+        # 每个分类只枚举一次目录；DirEntry 可复用目录枚举中的文件类型信息。
+        # 保留只跳过文件的语义，避免把同名目录误认为已下载资源。
+        with os.scandir(category_path) as entries:
+            downloaded_names = {
+                os.path.normcase(entry.name) for entry in entries if entry.is_file()
+            }
         for url in resource_urls.get(category, []):
             file_name = get_image_name_by_URL(url)
             if not file_name:
                 print(f"跳过无法取得文件名的资源 URL：{url}")
                 continue
             target_file = category_path / file_name
-            if target_file.is_file():
+            name_key = os.path.normcase(file_name)
+            if name_key in downloaded_names:
                 continue
             image_bytes = None
             for attempt in range(3):
@@ -1261,10 +1268,12 @@ async def download_comment_resources(resource_urls: dict, base_path: Path,
                 with temporary_path.open("wb") as file:
                     file.write(image_bytes)
                 os.replace(temporary_path, target_file)
-                print(f"已下载评论资源：{target_file}")
-            finally:
-                if temporary_path.exists():
-                    temporary_path.unlink()
+            except BaseException:
+                # 成功替换后临时文件已不存在，仅失败时清理，省去逐文件 exists()。
+                temporary_path.unlink(missing_ok=True)
+                raise
+            downloaded_names.add(name_key)
+            print(f"已下载评论资源：{target_file}")
             await asyncio.sleep(0.3)
 
 

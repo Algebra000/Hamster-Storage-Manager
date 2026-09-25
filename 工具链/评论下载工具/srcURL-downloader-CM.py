@@ -1173,6 +1173,8 @@ def build_cm_src_url(metadata_dir: Path) -> list:
         seen_bvids.add(bv)
         # 评论来源名称独立于弹幕来源名称，不能沿用 dm1、dm2 等名称。
         merged.append({"src": "B站", "BV": bv})
+    for index, item in enumerate(merged, start=1):
+        item["name"] = f"来源{index}"
     # 保留 cm-srcURL.json 中手工补充、但当前 dm-srcURL.json 没有的 BV。
     for item in cm_sources:
         if not isinstance(item, dict):
@@ -1181,9 +1183,7 @@ def build_cm_src_url(metadata_dir: Path) -> list:
         if not bv or bv in seen_bvids:
             continue
         seen_bvids.add(bv)
-        merged.append({"src": item.get("src", "B站"), "BV": bv})
-    for index, item in enumerate(merged, start=1):
-        item["name"] = f"来源{index}"
+        merged.append(item)# 原封不动的保留 cm-srcURL.json 中的已有项
     write_json_file(cm_path, merged)
     print(f"已生成或更新评论来源文件：{cm_path}，共 {len(merged)} 个 BV 来源")
     return merged

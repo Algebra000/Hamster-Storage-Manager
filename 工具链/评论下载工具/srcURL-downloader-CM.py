@@ -1461,38 +1461,43 @@ def schema_has_table(connection: sqlite3.Connection, schema: str,
     ).fetchone() is not None
 
 
+def _ensure_comment_top_table(connection: sqlite3.Connection) -> None:
+    """在当前连接补齐旧版 top 表；事务和最终校验由调用方负责。"""
+    if not schema_has_table(connection, "main", "top"):
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='main'"
+        ).fetchone()
+        if not row or not row[0]:
+            raise ValueError("旧评论数据库缺少 main 表")
+        create_sql, replacements = re.subn(
+            r'^(CREATE\s+TABLE\s+)(?:"main"|main)',
+            r'\1"top"', row[0], count=1, flags=re.IGNORECASE,
+        )
+        if replacements != 1:
+            raise ValueError("无法从 main 表升级 top 表")
+        connection.execute(create_sql)
+        top_columns = {
+            name for name, _ in table_columns(connection, "main", "top")
+        }
+        for key in ("mid", "ctime", "like", "parent", "root"):
+            if key in top_columns:
+                connection.execute(
+                    f'CREATE INDEX {quote_db_identifier(f"idx_top_{key}")} '
+                    f'ON "top"({quote_db_identifier(key)})'
+                )
+    connection.execute(
+        "INSERT INTO _metadata(metadata_key,metadata_value) VALUES('top_count','0') "
+        "ON CONFLICT(metadata_key) DO NOTHING"
+    )
+
+
 def ensure_comment_database_top_table(database_path: Path) -> None:
     """把旧 v1.1 快照就地补齐为空的 top 表和 top_count 元数据。"""
     connection = sqlite3.connect(Path(database_path))
     try:
         connection.execute("PRAGMA foreign_keys=ON")
         validate_comment_database(connection, "main")
-        if not schema_has_table(connection, "main", "top"):
-            row = connection.execute(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name='main'"
-            ).fetchone()
-            if not row or not row[0]:
-                raise ValueError(f"旧评论数据库缺少 main 表：{database_path}")
-            create_sql, replacements = re.subn(
-                r'^(CREATE\s+TABLE\s+)(?:"main"|main)',
-                r'\1"top"', row[0], count=1, flags=re.IGNORECASE,
-            )
-            if replacements != 1:
-                raise ValueError(f"无法从 main 表升级 top 表：{database_path}")
-            connection.execute(create_sql)
-            top_columns = {
-                name for name, _ in table_columns(connection, "main", "top")
-            }
-            for key in ("mid", "ctime", "like", "parent", "root"):
-                if key in top_columns:
-                    connection.execute(
-                        f'CREATE INDEX {quote_db_identifier(f"idx_top_{key}")} '
-                        f'ON "top"({quote_db_identifier(key)})'
-                    )
-        connection.execute(
-            "INSERT INTO _metadata(metadata_key,metadata_value) VALUES('top_count','0') "
-            "ON CONFLICT(metadata_key) DO NOTHING"
-        )
+        _ensure_comment_top_table(connection)
         connection.commit()
         foreign_key_errors = connection.execute(
             "PRAGMA main.foreign_key_check"
@@ -1732,6 +1737,85 @@ def insert_attached_rows(connection: sqlite3.Connection, table: str) -> None:
     )
 
 
+def _apply_attached_comment_delta(connection: sqlite3.Connection,
+                                  delta_path: Path) -> None:
+    """应用已附加的 delta_db；不提交、不扫描全库。"""
+    metadata = delta_metadata(connection)
+    if metadata.get("delta_schema_version") != COMMENT_DELTA_SCHEMA_VERSION:
+        raise ValueError(f"不支持的评论增量数据库：{delta_path}")
+    if metadata.get("volatile_fields") != ",".join(COMMENT_VOLATILE_FIELDS):
+        raise ValueError(f"增量库的九字段哈希口径不一致：{delta_path}")
+    delta_comment_tables = ["main", "reply"]
+    if schema_has_table(connection, "delta_db", "top"):
+        delta_comment_tables.insert(1, "top")
+    for table in ("member", "content", *delta_comment_tables):
+        ensure_delta_columns(connection, table)
+    connection.execute("CREATE TEMP TABLE _apply_ids(rpid INTEGER PRIMARY KEY)")
+    for table in delta_comment_tables:
+        connection.execute(
+            f"INSERT OR IGNORE INTO temp._apply_ids "
+            f"SELECT rpid FROM delta_db.{quote_db_identifier(table)}"
+        )
+    # 同一 rpid 的整组记录用最新版本替换；删除清单不参与历史合并。
+    connection.execute(
+        "DELETE FROM main WHERE rpid IN (SELECT rpid FROM temp._apply_ids)"
+    )
+    connection.execute(
+        "DELETE FROM reply WHERE rpid IN (SELECT rpid FROM temp._apply_ids)"
+    )
+    connection.execute(
+        "DELETE FROM top WHERE rpid IN (SELECT rpid FROM temp._apply_ids)"
+    )
+    connection.execute(
+        "DELETE FROM member WHERE parent IN (SELECT rpid FROM temp._apply_ids)"
+    )
+    connection.execute(
+        "DELETE FROM content WHERE parent IN (SELECT rpid FROM temp._apply_ids)"
+    )
+    insert_attached_rows(connection, "member")
+    insert_attached_rows(connection, "content")
+    for table in delta_comment_tables:
+        insert_attached_rows(connection, table)
+    connection.execute("DROP TABLE temp._apply_ids")
+
+
+def _finish_comment_merge(connection: sqlite3.Connection) -> None:
+    """合并完成后更新计数和元数据，并统一校验最终结果。"""
+    main_count = connection.execute("SELECT COUNT(*) FROM main").fetchone()[0]
+    top_count = connection.execute("SELECT COUNT(*) FROM top").fetchone()[0]
+    reply_count = connection.execute("SELECT COUNT(*) FROM reply").fetchone()[0]
+    metadata_updates = {
+        "schema_version": COMMENT_DB_SCHEMA_VERSION,
+        "volatile_fields": ",".join(COMMENT_VOLATILE_FIELDS),
+        "source_name": "merged-comment-history",
+        "source_hash_mode": "merged-comment-history-v1",
+        "created_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "main_count": str(main_count),
+        "top_count": str(top_count),
+        "reply_count": str(reply_count),
+    }
+    connection.executemany(
+        "INSERT INTO _metadata(metadata_key,metadata_value) VALUES(?,?) "
+        "ON CONFLICT(metadata_key) DO UPDATE "
+        "SET metadata_value=excluded.metadata_value",
+        metadata_updates.items(),
+    )
+    foreign_key_errors = connection.execute(
+        "PRAGMA main.foreign_key_check"
+    ).fetchall()
+    if foreign_key_errors:
+        raise sqlite3.IntegrityError(
+            f"合并数据库外键检查失败：{foreign_key_errors[:3]}"
+        )
+    integrity_result = connection.execute(
+        "PRAGMA main.integrity_check"
+    ).fetchall()
+    if integrity_result != [("ok",)]:
+        raise sqlite3.DatabaseError(
+            f"合并数据库完整性检查失败：{integrity_result[:3]}"
+        )
+
+
 def apply_comment_delta(database_path: Path, delta_path: Path) -> None:
     """把增量中的新增/变化覆盖到合并库；刻意忽略删除清单。"""
     ensure_comment_database_top_table(database_path)
@@ -1742,77 +1826,9 @@ def apply_comment_delta(database_path: Path, delta_path: Path) -> None:
         connection.execute(
             "ATTACH DATABASE ? AS delta_db", (str(Path(delta_path).resolve()),)
         )
-        metadata = delta_metadata(connection)
-        if metadata.get("delta_schema_version") != COMMENT_DELTA_SCHEMA_VERSION:
-            raise ValueError(f"不支持的评论增量数据库：{delta_path}")
-        if metadata.get("volatile_fields") != ",".join(COMMENT_VOLATILE_FIELDS):
-            raise ValueError(f"增量库的九字段哈希口径不一致：{delta_path}")
-        delta_comment_tables = ["main", "reply"]
-        if schema_has_table(connection, "delta_db", "top"):
-            delta_comment_tables.insert(1, "top")
         connection.execute("BEGIN IMMEDIATE")
-        for table in ("member", "content", *delta_comment_tables):
-            ensure_delta_columns(connection, table)
-        connection.execute("CREATE TEMP TABLE _apply_ids(rpid INTEGER PRIMARY KEY)")
-        for table in delta_comment_tables:
-            connection.execute(
-                f"INSERT OR IGNORE INTO temp._apply_ids "
-                f"SELECT rpid FROM delta_db.{quote_db_identifier(table)}"
-            )
-        # 同一 rpid 的整组记录用最新版本替换；删除清单不参与历史合并。
-        connection.execute(
-            "DELETE FROM main WHERE rpid IN (SELECT rpid FROM temp._apply_ids)"
-        )
-        connection.execute(
-            "DELETE FROM reply WHERE rpid IN (SELECT rpid FROM temp._apply_ids)"
-        )
-        connection.execute(
-            "DELETE FROM top WHERE rpid IN (SELECT rpid FROM temp._apply_ids)"
-        )
-        connection.execute(
-            "DELETE FROM member WHERE parent IN (SELECT rpid FROM temp._apply_ids)"
-        )
-        connection.execute(
-            "DELETE FROM content WHERE parent IN (SELECT rpid FROM temp._apply_ids)"
-        )
-        insert_attached_rows(connection, "member")
-        insert_attached_rows(connection, "content")
-        for table in delta_comment_tables:
-            insert_attached_rows(connection, table)
-        main_count = connection.execute("SELECT COUNT(*) FROM main").fetchone()[0]
-        top_count = connection.execute("SELECT COUNT(*) FROM top").fetchone()[0]
-        reply_count = connection.execute("SELECT COUNT(*) FROM reply").fetchone()[0]
-        metadata_updates = {
-            "schema_version": COMMENT_DB_SCHEMA_VERSION,
-            "volatile_fields": ",".join(COMMENT_VOLATILE_FIELDS),
-            "source_name": "merged-comment-history",
-            "source_hash_mode": "merged-comment-history-v1",
-            "created_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "main_count": str(main_count),
-            "top_count": str(top_count),
-            "reply_count": str(reply_count),
-        }
-        connection.executemany(
-            "INSERT INTO _metadata(metadata_key,metadata_value) VALUES(?,?) "
-            "ON CONFLICT(metadata_key) DO UPDATE "
-            "SET metadata_value=excluded.metadata_value",
-            metadata_updates.items(),
-        )
-        connection.execute("DROP TABLE temp._apply_ids")
-        foreign_key_errors = connection.execute(
-            "PRAGMA main.foreign_key_check"
-        ).fetchall()
-        if foreign_key_errors:
-            raise sqlite3.IntegrityError(
-                f"合并数据库外键检查失败：{foreign_key_errors[:3]}"
-            )
-        integrity_result = connection.execute(
-            "PRAGMA main.integrity_check"
-        ).fetchall()
-        if integrity_result != [("ok",)]:
-            raise sqlite3.DatabaseError(
-                f"合并数据库完整性检查失败：{integrity_result[:3]}"
-            )
+        _apply_attached_comment_delta(connection, delta_path)
+        _finish_comment_merge(connection)
         connection.commit()
     except Exception:
         if connection.in_transaction:
@@ -1834,14 +1850,71 @@ def rebuild_merged_database(update_dir: Path, file_name: str,
         else:
             raise FileNotFoundError(f"找不到评论基库：{baseline}")
     temporary_path = merged_path.with_name(merged_path.name + ".rebuild.tmp")
+    deltas = delta_paths(update_dir, file_name)
+    deleted_rpids = set()
+    connection = None
     try:
         shutil.copy2(baseline, temporary_path)
-        deltas = delta_paths(update_dir, file_name)
+        # 这些设置仅用于可丢弃的重建临时库，绝不能用于正式库的增量更新。
+        # 异常时关闭并删除整个临时库，不依赖回滚恢复；正式库保持原样。
+        connection = sqlite3.connect(temporary_path)
+        connection.execute("PRAGMA journal_mode=OFF")
+        connection.execute("PRAGMA synchronous=OFF")
+        connection.execute("PRAGMA temp_store=MEMORY")
+        connection.execute("PRAGMA cache_size=-65536")  # 页缓存约 64 MiB
+        # 避免删除每个实体时扫描所有引用表，最后统一检查外键。
+        connection.execute("PRAGMA foreign_keys=OFF")
+        validate_comment_database(connection, "main")
+        if deltas:
+            _ensure_comment_top_table(connection)
+            connection.commit()
         for delta in deltas:
-            apply_comment_delta(temporary_path, delta)
+            # 每次只附加一个增量，兼容任意数量历史库；保留原始路径以支持 UNC。
+            if not delta.is_file():
+                raise FileNotFoundError(f"找不到评论增量库：{delta}")
+            connection.execute(
+                "ATTACH DATABASE ? AS delta_db",
+                (str(delta.resolve()),),
+            )
+            connection.execute("BEGIN")
+            _apply_attached_comment_delta(connection, delta)
+            deleted_rpids.update(
+                int(row[0]) for row in connection.execute(
+                    "SELECT rpid FROM delta_db._deleted_records"
+                )
+            )
+            # DETACH 要求当前事务结束；禁用临时库日志后不再逐增量写回滚日志。
+            connection.commit()
+            connection.execute("DETACH DATABASE delta_db")
+        if deltas:
+            _finish_comment_merge(connection)
+        else:
+            # 无增量时保持基库表结构和元数据不变，也校验后才发布。
+            foreign_key_errors = connection.execute(
+                "PRAGMA main.foreign_key_check"
+            ).fetchmany(3)
+            if foreign_key_errors:
+                raise sqlite3.IntegrityError(
+                    f"合并数据库外键检查失败：{foreign_key_errors}"
+                )
+            integrity_result = connection.execute(
+                "PRAGMA main.integrity_check"
+            ).fetchall()
+            if integrity_result != [("ok",)]:
+                raise sqlite3.DatabaseError(
+                    f"合并数据库完整性检查失败：{integrity_result[:3]}"
+                )
+        connection.commit()
+        # 校验成功后关闭连接并同步文件，以便 Windows 原子替换。
+        connection.close()
+        connection = None
+        with temporary_path.open("rb+") as database_file:
+            os.fsync(database_file.fileno())
         os.replace(temporary_path, merged_path)
-        rebuild_comment_deletelist(update_dir, file_name, deltas)
+        write_comment_deletelist(update_dir, file_name, deleted_rpids)
     finally:
+        if connection is not None:
+            connection.close()
         if temporary_path.exists():
             temporary_path.unlink()
     print(f"已从基库和 {len(deltas)} 个增量库重建：{merged_path}")
@@ -2027,6 +2100,7 @@ async def process_comment_sources(metadata_dir: Path, sources: list,
                         continue
 
                     merged_path = comment_dir / file_name
+                    print("合并增量库中......")
                     rebuild_merged_database(update_dir, file_name, merged_path)
                     raw_path = raw_dir / file_name
                     try:

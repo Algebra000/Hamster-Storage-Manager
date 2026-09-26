@@ -483,8 +483,15 @@ class StreamingCommentDatabaseWriter:
             registering = False
             self._insert_comment_rows(table_name, comment_dict, rpid)
         except Exception as error:
-            self.connection.execute("ROLLBACK TO insert_comment")
-            self.connection.execute("RELEASE insert_comment")
+            # FULL/IOERR 等错误可能已自动回滚整个页事务，保存点随之消失。
+            # 此时必须终止写入并保留原始错误，不能继续使用已失效的页内计数。
+            if not self.connection.in_transaction:
+                raise
+            try:
+                self.connection.execute("ROLLBACK TO insert_comment")
+                self.connection.execute("RELEASE insert_comment")
+            except sqlite3.Error as cleanup_error:
+                raise error from cleanup_error
             # 只恢复 ID 登记表的主键冲突，实体/评论的其他约束错误照常抛出。
             # Python 3.8 没有 sqlite_errorcode；精确匹配表和列，兼容旧版 sqlite3。
             if not (registering and isinstance(error, sqlite3.IntegrityError)
@@ -507,10 +514,15 @@ class StreamingCommentDatabaseWriter:
                         "UPDATE temp._written_comments SET table_name='top' WHERE rpid=?",
                         (rpid,),
                     )
-                except Exception:
-                    self.connection.execute("ROLLBACK TO promote_comment")
+                except Exception as error:
+                    if self.connection.in_transaction:
+                        try:
+                            self.connection.execute("ROLLBACK TO promote_comment")
+                            self.connection.execute("RELEASE promote_comment")
+                        except sqlite3.Error as cleanup_error:
+                            raise error from cleanup_error
                     raise
-                finally:
+                else:
                     self.connection.execute("RELEASE promote_comment")
                 self.main_count -= 1
                 self.top_count += 1
@@ -2155,9 +2167,15 @@ async def process_comment_sources(metadata_dir: Path, sources: list,
                 processed_comment_sources[run_key] = file_name
                 print(f"评论来源处理完成：{source_name}（{bvid}）-> {file_name}")
             except Exception as error:
+                sqlite_details = ""
+                if isinstance(error, sqlite3.Error):
+                    sqlite_details = (
+                        f" [SQLite: {getattr(error, 'sqlite_errorname', 'unknown')}, "
+                        f"code={getattr(error, 'sqlite_errorcode', 'unknown')}]"
+                    )
                 print_error(
                     f"评论来源处理失败：{source_name}（{bvid}）："
-                    f"{type(error).__name__}: {error}"
+                    f"{type(error).__name__}: {error}{sqlite_details}"
                 )
 
         resources_path = comment_dir / "resources-URL.json"

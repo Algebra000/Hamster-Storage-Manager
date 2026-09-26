@@ -1548,6 +1548,10 @@ const CS_COMMENT_DIV_TEMPLATE =
         </div>
 </body>
 </html>`
+//[DEBUG-START] 性能调试代码，release时删掉
+// 临时评论性能诊断开关，与后端 COMMENT_PERF_DEBUG 分别控制。
+const CS_COMMENT_PERF_DEBUG = true;
+//[DEBUG-END]
 class CS_VideoPlayerWidget {
     constructor(rootPath, episodes, currentEpisode, haveEpisodeBar = false, haveComment = false) {
         /**
@@ -1632,6 +1636,9 @@ class CS_VideoPlayerWidget {
         this.commentFilteredCount = 0; // 当前筛选条件命中的顶层评论数量。
         this.commentInfoRequestId = ''; // 当前有效的评论信息请求编号。
         this.commentHtmlRequestId = ''; // 当前有效的评论 HTML 请求编号。
+        //[DEBUG-START] 性能调试代码，release时删掉
+        this.commentPerformanceRequest = null; // 仅保存最新请求的性能计时，避免累积。
+        //[DEBUG-END]
         this.commentSourceInfoRequestId = ''; // 当前有效的评论来源信息修改请求编号。
         this.commentSourceInfoPending = null; // 来源名称保存失败时用于回滚的待确认修改。
         this.commentRequestSerial = 0; // 生成评论请求编号的递增序号。
@@ -2109,7 +2116,7 @@ class CS_VideoPlayerWidget {
         this.setCommentContent('', emptyText);
     }
 
-    setCommentContent(htmlText, emptyText = '') {
+    setCommentContent(htmlText, emptyText = '', perfStep = null) {
         if (!this.commentList) return;
         if (this.commentFontStyleElement) {
             this.commentFontStyleElement.remove();
@@ -2118,7 +2125,13 @@ class CS_VideoPlayerWidget {
         if (htmlText) {
             this.commentList.classList.remove('cs-cmt-v1-comment-list-empty');
             this.commentList.innerHTML = htmlText;
+            //[DEBUG-START] 性能调试代码，release时删掉
+            if (perfStep) perfStep('innerHTML 解析及插入');
+            //[DEBUG-END]
             this.normalizeCommentContentActions();
+            //[DEBUG-START] 性能调试代码，release时删掉
+            if (perfStep) perfStep('评论事件属性转换');
+            //[DEBUG-END]
             const fontStyles = Array.from(this.commentList.querySelectorAll('style'))
                 .filter((style) => style.textContent.includes('@font-face'));
             if (fontStyles.length) {
@@ -2131,6 +2144,9 @@ class CS_VideoPlayerWidget {
                 fontStyles.forEach((style) => style.remove());
             }
             this.prefixCommentElementNames(this.commentList);
+            //[DEBUG-START] 性能调试代码，release时删掉
+            if (perfStep) perfStep('字体样式迁移及 class/id 处理');
+            //[DEBUG-END]
         } else {
             this.commentList.classList.add('cs-cmt-v1-comment-list-empty');
             this.commentList.textContent = emptyText || '暂无评论';
@@ -2138,6 +2154,9 @@ class CS_VideoPlayerWidget {
         if (this.commentScrollContainer) {
             this.commentScrollContainer.scrollTop = 0;
         }
+        //[DEBUG-START] 性能调试代码，release时删掉
+        if (perfStep) perfStep('重置滚动位置（可能触发布局计算）');
+        //[DEBUG-END]
     }
 
     /** 将旧后端进程生成的内联事件转换成普通评论根 div 事件代理使用的 data 属性。 */
@@ -2891,9 +2910,22 @@ class CS_VideoPlayerWidget {
         const source = this.commentCurrentSource;
         if (!this.commentExpanded || !source || !this.currentEpisode) return;
         const requestId = `${this.widgetId}_comment_html_${++this.commentRequestSerial}`;
+        //[DEBUG-START] 性能调试代码，release时删掉
+        const perfStart = CS_COMMENT_PERF_DEBUG ? performance.now() : 0;
+        this.commentPerformanceRequest = CS_COMMENT_PERF_DEBUG
+            ? { requestId, started: perfStart, sent: 0 } : null;
+        //[DEBUG-END]
         this.commentHtmlRequestId = requestId;
         this.setCommentContent('', '正在加载评论…');
         const keyword = this.commentKeywordInput ? this.commentKeywordInput.value.trim() : '';
+        //[DEBUG-START] 性能调试代码，release时删掉
+        if (this.commentPerformanceRequest) {
+            this.commentPerformanceRequest.sent = performance.now();
+            console.log(`[评论性能][${requestId}] 请求准备: ${(performance.now() - perfStart).toFixed(2)} ms`,
+                { database: source.databasePath, page: this.commentCurrentPage,
+                    pageSize: this.commentSettings.pageSize });
+        }
+        //[DEBUG-END]
         this.sendCommand('CS_GET_COMMENT_HTML', {
             requestId,
             metadataPath: this.currentCommentMetadataPath(),
@@ -2922,6 +2954,22 @@ class CS_VideoPlayerWidget {
         if (!this.commentExpanded || data.requestId !== this.commentHtmlRequestId) return;
         if (!this.commentCurrentSource
             || data.databasePath !== this.commentCurrentSource.databasePath) return;
+        //[DEBUG-START] 性能调试代码，release时删掉
+        const trace = this.commentPerformanceRequest;
+        const perfEnabled = CS_COMMENT_PERF_DEBUG && trace && trace.requestId === data.requestId;
+        let previous = performance.now();
+        const records = [];
+        const perfStep = perfEnabled ? (label) => {
+            const now = performance.now();
+            records.push({ stage: label, ms: +(now - previous).toFixed(2),
+                totalMs: +(now - trace.started).toFixed(2) });
+            previous = now;
+        } : null;
+        if (perfEnabled) {
+            console.log(`[评论性能][${data.requestId}] 响应到达: ${(previous - trace.sent).toFixed(2)} ms（含后端、传输、消息排队及 JSON 解析）`,
+                { htmlChars: (data.html || '').length });
+        }
+        //[DEBUG-END]
         this.commentCurrentPage = Math.max(1, Number(data.page) || 1);
         this.commentFilteredCount = Math.max(0, Number(data.totalCount) || 0);
         this.commentTotalPages = Math.max(1, Number(data.totalPages) || 1);
@@ -2930,6 +2978,16 @@ class CS_VideoPlayerWidget {
             this.commentFilteredCount ? '评论加载失败' : '该来源没有评论'
         );
         this.renderCommentPagination();
+        //[DEBUG-START] 性能调试代码，release时删掉
+        if (perfStep) {
+            perfStep('分页控件更新');
+            console.log(`[评论性能][${data.requestId}] DOM 阶段`, records);
+            requestAnimationFrame(() => requestAnimationFrame(() => {
+                if (this.commentHtmlRequestId !== data.requestId || !this.commentExpanded) return;
+                console.log(`[评论性能][${data.requestId}] 第二动画帧: ${(performance.now() - trace.started).toFixed(2)} ms（近似绘制时点，不代表图片已加载）`);
+            }));
+        }
+        //[DEBUG-END]
     }
 
     handleCommentError(data) {

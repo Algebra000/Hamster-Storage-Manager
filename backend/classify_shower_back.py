@@ -68,6 +68,32 @@ def _open_comment_database_readonly(database_path):
     connection.execute("PRAGMA query_only=ON")
     return connection
 
+#[DEBUG-START] 性能调试代码，release时删掉
+# 临时评论性能诊断开关；排查结束后可关闭。
+COMMENT_PERF_DEBUG = False
+
+
+
+class CommentPerformanceTrace:
+    def __init__(self, request_id):
+        self.request_id = request_id
+        self.started = self.previous = time.perf_counter()
+        self.records = []
+
+    def step(self, label, **details):
+        if not COMMENT_PERF_DEBUG:
+            return
+        now = time.perf_counter()
+        self.records.append((label, (now - self.previous) * 1000,
+                             (now - self.started) * 1000, details))
+        self.previous = now
+
+    def report(self):
+        # 请求结束后统一输出，避免每阶段终端打印影响后续阶段计时。
+        for label, elapsed, total, details in self.records:
+            print(f"[评论性能][{self.request_id}] {label}: {elapsed:.2f} ms "
+                  f"(累计 {total:.2f} ms) {details}")
+#[DEBUG-END]
 
 class CommentPageConnectionManager:
     """只缓存最近一次正常评论页面查询使用的 SQLite 只读连接。"""
@@ -300,6 +326,20 @@ def _build_comment_where(keyword, only_deleted, only_vip,
     return (" WHERE " + " AND ".join(conditions) if conditions else ""), params
 
 
+def _comment_filter_joins(where_sql):
+    """只关联筛选实际使用的表；where_sql 仅来自 _build_comment_where。
+
+    无筛选时的 COUNT 不需要读取正文和用户记录，尤其应避免在 UNC 库上
+    对每条评论额外执行两次主键查找。关键词参数独立绑定，不参与此判断。
+    """
+    joins = []
+    if 'content.' in where_sql:
+        joins.append('LEFT JOIN content ON content.parent=comment.rpid ')
+    if 'member.' in where_sql:
+        joins.append('LEFT JOIN member ON member.parent=comment.rpid ')
+    return ''.join(joins)
+
+
 def _select_comment_table_rows(connection, table_name, sort_by, reverse,
                                offset, limit, where_sql, where_params):
     if table_name not in {"top", "main"}:
@@ -308,8 +348,7 @@ def _select_comment_table_rows(connection, table_name, sort_by, reverse,
     direction = "DESC" if reverse else "ASC"
     query = (
         f'SELECT comment.* FROM "{table_name}" AS comment '
-        'LEFT JOIN content ON content.parent=comment.rpid '
-        'LEFT JOIN member ON member.parent=comment.rpid '
+        f'{_comment_filter_joins(where_sql)}'
         f'{where_sql} ORDER BY comment."{sort_column}" {direction}, '
         f'comment.rpid {direction} LIMIT ? OFFSET ?'
     )
@@ -319,10 +358,11 @@ def _select_comment_table_rows(connection, table_name, sort_by, reverse,
 
 
 def _count_comment_table_rows(connection, table_name, where_sql, where_params):
+    if table_name not in {"top", "main"}:
+        raise ValueError("不允许的评论表")
     query = (
         f'SELECT COUNT(*) FROM "{table_name}" AS comment '
-        'LEFT JOIN content ON content.parent=comment.rpid '
-        'LEFT JOIN member ON member.parent=comment.rpid '
+        f'{_comment_filter_joins(where_sql)}'
         f'{where_sql}'
     )
     return int(connection.execute(query, where_params).fetchone()[0])
@@ -333,7 +373,7 @@ def load_comment_page_from_database(database_path, sort_by, page, page_size,
                                     only_vip=False, word_filter_enabled=False,
                                     word_count=0, word_direction="above",
                                     deleted_rpids=None,
-                                    connection_manager=None):
+                                    connection_manager=None, perf=None):
     """按 top + main 的连续序列筛选并还原一页 v1.1 评论。"""
     sort_by = sort_by if sort_by in {"like", "time"} else "time"
     page_size = min(max(int(page_size), 1), 200)
@@ -341,6 +381,11 @@ def load_comment_page_from_database(database_path, sort_by, page, page_size,
     deleted_rpids = {int(value) for value in (deleted_rpids or [])}
     database_path = os.path.abspath(os.path.normpath(os.fspath(database_path)))
     owns_connection = connection_manager is None
+    #[DEBUG-START] 性能调试代码，release时删掉
+    reused = (not owns_connection and connection_manager.connection is not None
+              and connection_manager.database_path ==
+              connection_manager.normalize_path(database_path))
+    #[DEBUG-END]
     connection = (
         _open_comment_database_readonly(database_path)
         if owns_connection else connection_manager.acquire(database_path)
@@ -351,6 +396,13 @@ def load_comment_page_from_database(database_path, sort_by, page, page_size,
         lambda rpid: int(_comment_integer_id(rpid) in deleted_rpids),
     )
     connection.create_function("cs_is_vip", 1, _comment_vip_json)
+    #[DEBUG-START] 性能调试代码，release时删掉
+    if perf:
+        perf.step('获取连接及注册函数', reused=reused, database=database_path,
+                  page=requested_page, pageSize=page_size, sortBy=sort_by,
+                  keywordEnabled=bool(keyword), onlyDeleted=only_deleted,
+                  onlyVip=only_vip, wordFilterEnabled=word_filter_enabled)
+    #[DEBUG-END]
     try:
         tables = {
             row[0] for row in connection.execute(
@@ -370,6 +422,10 @@ def load_comment_page_from_database(database_path, sort_by, page, page_size,
                 f"当前只支持 {COMMENT_DATABASE_SCHEMA_VERSION!r}"
             )
 
+        #[DEBUG-START] 性能调试代码，release时删掉
+        if perf:
+            perf.step('读取表结构及元数据')
+        #[DEBUG-END]
         where_sql, where_params = _build_comment_where(
             keyword, only_deleted, only_vip, word_filter_enabled,
             word_count, word_direction,
@@ -378,9 +434,17 @@ def load_comment_page_from_database(database_path, sort_by, page, page_size,
             _count_comment_table_rows(connection, "top", where_sql, where_params)
             if "top" in tables else 0
         )
+        #[DEBUG-START] 性能调试代码，release时删掉
+        if perf:
+            perf.step('top 筛选计数', rows=top_count)
+        #[DEBUG-END]
         main_count = _count_comment_table_rows(
             connection, "main", where_sql, where_params
         )
+        #[DEBUG-START] 性能调试代码，release时删掉
+        if perf:
+            perf.step('main 筛选计数', rows=main_count)
+        #[DEBUG-END]
         total_count = top_count + main_count
         total_pages = max(1, (total_count + page_size - 1) // page_size)
         selected_page = min(requested_page, total_pages)
@@ -395,6 +459,10 @@ def load_comment_page_from_database(database_path, sort_by, page, page_size,
                     connection, "top", sort_by, True,
                     start, top_limit, where_sql, where_params,
                 )
+        #[DEBUG-START] 性能调试代码，release时删掉
+        if perf:
+            perf.step('top 排序分页查询', rows=len(top_rows))
+        #[DEBUG-END]
         main_start = max(start - top_count, 0)
         main_limit = max(0, end - max(start, top_count))
         main_rows = []
@@ -404,14 +472,34 @@ def load_comment_page_from_database(database_path, sort_by, page, page_size,
                 main_start, main_limit, where_sql, where_params,
             )
 
+        #[DEBUG-START] 性能调试代码，release时删掉
+        if perf:
+            perf.step('main 排序分页查询', rows=len(main_rows), offset=main_start)
+        #[DEBUG-END]
         parent_ids = [int(row["rpid"]) for row in top_rows + main_rows]
         reply_rows = _select_comment_replies(connection, parent_ids)
+        #[DEBUG-START] 性能调试代码，release时删掉
+        if perf:
+            perf.step('查询本页全部回复并排序', rows=len(reply_rows))
+        #[DEBUG-END]
         all_ids = parent_ids + [int(row["rpid"]) for row in reply_rows]
         members = _load_comment_entity_rows(connection, "member", all_ids)
+        #[DEBUG-START] 性能调试代码，release时删掉
+        if perf:
+            perf.step('查询并解析 member', rows=len(members))
+        #[DEBUG-END]
         contents = _load_comment_entity_rows(connection, "content", all_ids)
+        #[DEBUG-START] 性能调试代码，release时删掉
+        if perf:
+            perf.step('查询并解析 content', rows=len(contents))
+        #[DEBUG-END]
         top_comments = _comment_rows_to_dicts(top_rows, members, contents)
         main_comments = _comment_rows_to_dicts(main_rows, members, contents)
         replies = _comment_rows_to_dicts(reply_rows, members, contents)
+        #[DEBUG-START] 性能调试代码，release时删掉
+        if perf:
+            perf.step('评论与回复字典组装')
+        #[DEBUG-END]
         if connection_manager is not None:
             connection_manager.touch(connection)
     except Exception:
@@ -436,6 +524,10 @@ def load_comment_page_from_database(database_path, sort_by, page, page_size,
         owner = _find_comment_main_rpid(reply, main_ids, replies_by_rpid)
         if owner is not None:
             main_by_rpid[owner]["replies"].append(reply)
+    #[DEBUG-START] 性能调试代码，release时删掉
+    if perf:
+        perf.step('归属回复及删除标记', comments=len(top_level), replies=len(replies))
+    #[DEBUG-END]
     return {
         "comments": top_level,
         "totalCount": total_count,
@@ -2633,7 +2725,7 @@ class ClassifyShowerModule:
             print(f"[分类展示模块] 保存评论阅读记录失败 {record_path}: {error}")
             return False
 
-    def build_comment_html_response(self, data):
+    def build_comment_html_response(self, data, perf=None):
         metadata_path = str(data.get('metadataPath', '') or '').strip()
         if not metadata_path:
             raise ValueError('缺少视频元数据文件夹路径')
@@ -2676,6 +2768,10 @@ class ClassifyShowerModule:
         word_count = max(0, int(data.get('wordCount', 0) or 0))
         word_direction = 'below' if data.get('wordDirection') == 'below' else 'above'
         update_dir = str(data.get('updateDir', '') or '')
+        #[DEBUG-START] 性能调试代码，release时删掉
+        if perf:
+            perf.step('解析路径和请求参数')
+        #[DEBUG-END]
         deleted_rpids = (
             self.load_comment_deletelist(database_path, update_dir)
             if (mark_deleted or only_deleted) and update_dir else set()
@@ -2683,6 +2779,10 @@ class ClassifyShowerModule:
         if not update_dir:
             mark_deleted = False
             only_deleted = False
+        #[DEBUG-START] 性能调试代码，release时删掉
+        if perf:
+            perf.step('加载删除列表', rows=len(deleted_rpids))
+        #[DEBUG-END]
 
         result = load_comment_page_from_database(
             database_path, sort_by, page, page_size,
@@ -2694,6 +2794,7 @@ class ClassifyShowerModule:
             word_direction=word_direction,
             deleted_rpids=deleted_rpids if (mark_deleted or only_deleted) else set(),
             connection_manager=self.comment_page_connection_manager,
+            perf=perf,
         )
         resource_root = str(data.get('resourcePath', '') or '').strip()
         if not resource_root:
@@ -2704,6 +2805,10 @@ class ClassifyShowerModule:
         basic_folder = str(
             data.get('basicResourceFolder') or 'bilibili-resource'
         ).strip() or 'bilibili-resource'
+        #[DEBUG-START] 性能调试代码，release时删掉
+        if perf:
+            perf.step('资源目录参数处理')
+        #[DEBUG-END]
         result['html'] = build_comment_font_style(
             resource_root, basic_folder
         ) + ''.join(
@@ -2713,6 +2818,10 @@ class ClassifyShowerModule:
             )
             for comment in result['comments']
         )
+        #[DEBUG-START] 性能调试代码，release时删掉
+        if perf:
+            perf.step('生成 HTML 及资源 URL', htmlChars=len(result['html']))
+        #[DEBUG-END]
         result.pop('comments', None)
         result['databasePath'] = database_path
 
@@ -2728,11 +2837,19 @@ class ClassifyShowerModule:
         if bool(data.get('updatePageSizeDefault', False)):
             config_updates['page-size'] = page_size
         self.get_comment_config(config_updates)
+        #[DEBUG-START] 性能调试代码，release时删掉
+        if perf:
+            perf.step('读取或保存评论配置')
+        #[DEBUG-END]
         if bool(data.get('updateReadRecord', False)) \
                 or result['page'] != result['requestedPage']:
             self.save_comment_read_record(
                 metadata_path, data.get('bvid', ''), result['page'], page_size
             )
+        #[DEBUG-START] 性能调试代码，release时删掉
+        if perf:
+            perf.step('按需保存阅读记录')
+        #[DEBUG-END]
         return result
 
 
@@ -2909,8 +3026,15 @@ class ClassifyShowerModule:
         elif command == 'CS_GET_COMMENT_HTML':
             widget_id = data.get('widgetId', '')
             request_id = data.get('requestId', '')
+            #[DEBUG-START] 性能调试代码，release时删掉
+            perf = CommentPerformanceTrace(request_id) if COMMENT_PERF_DEBUG else None
+            #[DEBUG-END]
             try:
-                result = self.build_comment_html_response(data)
+                result = self.build_comment_html_response(data,
+                #[DEBUG-START] 性能调试代码，release时删掉
+                 perf=perf
+                #[DEBUG-END]
+                 )
                 if result['page'] != result['requestedPage']:
                     await websocket.send(json.dumps({
                         'command': 'CS_COMMENT_SETPAGE',
@@ -2938,7 +3062,21 @@ class ClassifyShowerModule:
                     'stage': 'html',
                     'error': str(error),
                 }
-            await websocket.send(json.dumps(message, ensure_ascii=False))
+            payload = json.dumps(message, ensure_ascii=False)
+            #[DEBUG-START] 性能调试代码，release时删掉
+            if perf:
+                perf.step('响应组装及 JSON 序列化', chars=len(payload),
+                          command=message['command'])
+            #[DEBUG-END]
+            try:
+                await websocket.send(payload)
+            finally:
+                #[DEBUG-START] 性能调试代码，release时删掉
+                if perf:
+                    perf.step('WebSocket send 等待')
+                    perf.report()
+                #[DEBUG-END]
+                pass
 
         elif command == 'CS_SET_COMMENT_SOURCEINFO':
             widget_id = data.get('widgetId', '')

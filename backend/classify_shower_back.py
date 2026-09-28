@@ -70,7 +70,7 @@ def _open_comment_database_readonly(database_path):
 
 #[DEBUG-START] 性能调试代码，release时删掉
 # 临时评论性能诊断开关；排查结束后可关闭。
-COMMENT_PERF_DEBUG = False
+COMMENT_PERF_DEBUG = True
 
 
 
@@ -96,13 +96,14 @@ class CommentPerformanceTrace:
 #[DEBUG-END]
 
 class CommentPageConnectionManager:
-    """只缓存最近一次正常评论页面查询使用的 SQLite 只读连接。"""
+    """缓存最近一个来源的只读连接，以及最近一组筛选条件的分页准备结果。"""
 
     def __init__(self, idle_timeout=60.0):
         self.idle_timeout = max(0.0, float(idle_timeout))
         self.database_path = None
         self.connection = None
         self.idle_handle = None
+        self.query_cache = None
 
     @staticmethod
     def normalize_path(database_path):
@@ -145,6 +146,7 @@ class CommentPageConnectionManager:
             self.close()
 
     def close(self):
+        self.query_cache = None
         if self.idle_handle is not None:
             self.idle_handle.cancel()
             self.idle_handle = None
@@ -300,8 +302,31 @@ def _comment_vip_json(value):
     return int(isinstance(value, dict) and value.get("vipStatus") == 1)
 
 
+def _deleted_comment_candidates(connection, deleted_rpids):
+    """从删除 ID 反查回复归属，只读取命中回复的 root/parent。
+
+    保留原筛选语义：顶层评论自身被删除，或者有被删除的回复以它作为
+    root/parent 时，都显示该顶层评论。候选中的回复 ID、0 和不存在的 ID
+    不会匹配顶层表，不需要额外扫描 main/top 来逐一核实。
+    """
+    candidates = {int(value) for value in deleted_rpids}
+    for group in _comment_chunks(sorted(candidates), 800):
+        placeholders = ','.join('?' for _ in group)
+        rows = connection.execute(
+            'SELECT root,parent FROM reply '
+            f'WHERE rpid IN ({placeholders})', group,
+        )
+        for row in rows:
+            for value in row:
+                rpid = _comment_integer_id(value)
+                if rpid is not None:
+                    candidates.add(rpid)
+    return candidates
+
+
 def _build_comment_where(keyword, only_deleted, only_vip,
-                         word_filter_enabled, word_count, word_direction):
+                         word_filter_enabled, word_count, word_direction,
+                         deleted_candidates=None):
     conditions = []
     params = []
     if keyword:
@@ -309,14 +334,12 @@ def _build_comment_where(keyword, only_deleted, only_vip,
         conditions.append("COALESCE(content.message, '') LIKE ? ESCAPE '\\'")
         params.append(f"%{escaped}%")
     if only_deleted:
-        # 回复被删除时也要保留其顶层评论作为展示上下文，否则这条已删回复
-        # 没有可以挂载的父评论，会在“只显示被删数据”模式下彻底不可见。
-        conditions.append(
-            "(cs_is_deleted(comment.rpid) = 1 OR EXISTS("
-            "SELECT 1 FROM reply AS deleted_reply WHERE "
-            "(deleted_reply.root=comment.rpid OR deleted_reply.parent=comment.rpid) "
-            "AND cs_is_deleted(deleted_reply.rpid)=1))"
-        )
+        if deleted_candidates is None:
+            raise ValueError('删除筛选需要预先查询候选评论 ID')
+        # 仅拼接经 int 转换的整数，不包含外部 SQL 文本；避免大删除列表超过
+        # SQLite 绑定参数上限。计数和分页复用同一条件，不再逐条回查回复。
+        ids = ','.join(str(int(value)) for value in sorted(deleted_candidates))
+        conditions.append(f'comment.rpid IN ({ids})' if ids else '0')
     if only_vip:
         conditions.append("cs_is_vip(member.vip) = 1")
     if word_filter_enabled:
@@ -373,12 +396,15 @@ def load_comment_page_from_database(database_path, sort_by, page, page_size,
                                     only_vip=False, word_filter_enabled=False,
                                     word_count=0, word_direction="above",
                                     deleted_rpids=None,
-                                    connection_manager=None, perf=None):
+                                    connection_manager=None, perf=None,
+                                    deleted_loader=None, query_scope=None):
     """按 top + main 的连续序列筛选并还原一页 v1.1 评论。"""
     sort_by = sort_by if sort_by in {"like", "time"} else "time"
     page_size = min(max(int(page_size), 1), 200)
     requested_page = max(int(page), 1)
-    deleted_rpids = {int(value) for value in (deleted_rpids or [])}
+    # 直接调用时，删除 ID 的变化也是失效条件；页面请求使用延迟加载器，
+    # 让缓存命中时连 deletelist 文件都不必重新打开。
+    supplied_deleted = frozenset(int(value) for value in (deleted_rpids or []))
     database_path = os.path.abspath(os.path.normpath(os.fspath(database_path)))
     owns_connection = connection_manager is None
     #[DEBUG-START] 性能调试代码，release时删掉
@@ -391,11 +417,15 @@ def load_comment_page_from_database(database_path, sort_by, page, page_size,
         if owns_connection else connection_manager.acquire(database_path)
     )
     connection.row_factory = sqlite3.Row
-    connection.create_function(
-        "cs_is_deleted", 1,
-        lambda rpid: int(_comment_integer_id(rpid) in deleted_rpids),
-    )
     connection.create_function("cs_is_vip", 1, _comment_vip_json)
+    # 页码和每页条数不影响候选集合与总数，故不包含在缓存键里。
+    query_key = (database_path, query_scope, sort_by, keyword, only_deleted,
+                 only_vip, word_filter_enabled, word_count, word_direction,
+                 deleted_loader is not None, supplied_deleted)
+    cached = connection_manager.query_cache if connection_manager else None
+    if cached is not None and cached['key'] != query_key:
+        connection_manager.query_cache = None
+        cached = None
     #[DEBUG-START] 性能调试代码，release时删掉
     if perf:
         perf.step('获取连接及注册函数', reused=reused, database=database_path,
@@ -404,47 +434,87 @@ def load_comment_page_from_database(database_path, sort_by, page, page_size,
                   onlyVip=only_vip, wordFilterEnabled=word_filter_enabled)
     #[DEBUG-END]
     try:
-        tables = {
-            row[0] for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
+        if cached is None:
+            deleted_rpids = (
+                {int(value) for value in deleted_loader()}
+                if deleted_loader is not None else set(supplied_deleted)
             )
-        }
-        required = {"_metadata", "main", "reply", "member", "content"}
-        missing = required - tables
-        if missing:
-            raise ValueError("数据库缺少表：" + ", ".join(sorted(missing)))
-        metadata = dict(connection.execute(
-            "SELECT metadata_key,metadata_value FROM _metadata"
-        ))
-        if metadata.get("schema_version") != COMMENT_DATABASE_SCHEMA_VERSION:
-            raise ValueError(
-                f"评论数据库版本 {metadata.get('schema_version')!r}，"
-                f"当前只支持 {COMMENT_DATABASE_SCHEMA_VERSION!r}"
-            )
+            #[DEBUG-START] 性能调试代码，release时删掉
+            if perf:
+                perf.step('加载删除列表（准备缓存未命中）', rows=len(deleted_rpids))
+            #[DEBUG-END]
+            tables = {
+                row[0] for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            required = {"_metadata", "main", "reply", "member", "content"}
+            missing = required - tables
+            if missing:
+                raise ValueError("数据库缺少表：" + ", ".join(sorted(missing)))
+            metadata = dict(connection.execute(
+                "SELECT metadata_key,metadata_value FROM _metadata"
+            ))
+            if metadata.get("schema_version") != COMMENT_DATABASE_SCHEMA_VERSION:
+                raise ValueError(
+                    f"评论数据库版本 {metadata.get('schema_version')!r}，"
+                    f"当前只支持 {COMMENT_DATABASE_SCHEMA_VERSION!r}"
+                )
 
-        #[DEBUG-START] 性能调试代码，release时删掉
-        if perf:
-            perf.step('读取表结构及元数据')
-        #[DEBUG-END]
-        where_sql, where_params = _build_comment_where(
-            keyword, only_deleted, only_vip, word_filter_enabled,
-            word_count, word_direction,
-        )
-        top_count = (
-            _count_comment_table_rows(connection, "top", where_sql, where_params)
-            if "top" in tables else 0
-        )
-        #[DEBUG-START] 性能调试代码，release时删掉
-        if perf:
-            perf.step('top 筛选计数', rows=top_count)
-        #[DEBUG-END]
-        main_count = _count_comment_table_rows(
-            connection, "main", where_sql, where_params
-        )
-        #[DEBUG-START] 性能调试代码，release时删掉
-        if perf:
-            perf.step('main 筛选计数', rows=main_count)
-        #[DEBUG-END]
+            #[DEBUG-START] 性能调试代码，release时删掉
+            if perf:
+                perf.step('读取表结构及元数据')
+            #[DEBUG-END]
+            deleted_candidates = (
+                _deleted_comment_candidates(connection, deleted_rpids)
+                if only_deleted else None
+            )
+            #[DEBUG-START] 性能调试代码，release时删掉
+            if perf and only_deleted:
+                perf.step('删除 ID 反查 root/parent', deletedIds=len(deleted_rpids),
+                          candidateIds=len(deleted_candidates))
+            #[DEBUG-END]
+            where_sql, where_params = _build_comment_where(
+                keyword, only_deleted, only_vip, word_filter_enabled,
+                word_count, word_direction,
+                deleted_candidates=deleted_candidates,
+            )
+            top_count = (
+                _count_comment_table_rows(connection, "top", where_sql, where_params)
+                if "top" in tables else 0
+            )
+            #[DEBUG-START] 性能调试代码，release时删掉
+            if perf:
+                perf.step('top 筛选计数', rows=top_count)
+            #[DEBUG-END]
+            main_count = _count_comment_table_rows(
+                connection, "main", where_sql, where_params
+            )
+            #[DEBUG-START] 性能调试代码，release时删掉
+            if perf:
+                perf.step('main 筛选计数', rows=main_count)
+            #[DEBUG-END]
+            if connection_manager is not None:
+                connection_manager.query_cache = {
+                    'key': query_key,
+                    'deleted_rpids': deleted_rpids,
+                    'deleted_candidates': deleted_candidates,
+                    'where_sql': where_sql,
+                    'where_params': where_params,
+                    'top_count': top_count,
+                    'main_count': main_count,
+                }
+        else:
+            # 同一浏览会话的分页快照：不访问文件系统、不检查元数据、不重算。
+            deleted_rpids = cached['deleted_rpids']
+            where_sql, where_params = cached['where_sql'], cached['where_params']
+            top_count, main_count = cached['top_count'], cached['main_count']
+            #[DEBUG-START] 性能调试代码，release时删掉
+            if perf:
+                perf.step('复用分页准备缓存（跳过步骤1—5）',
+                          deletedIds=len(deleted_rpids),
+                          topCount=top_count, mainCount=main_count)
+            #[DEBUG-END]
         total_count = top_count + main_count
         total_pages = max(1, (total_count + page_size - 1) // page_size)
         selected_page = min(requested_page, total_pages)
@@ -2511,6 +2581,8 @@ class ClassifyShowerModule:
 
     def collect_comment_info(self, metadata_path):
         """按 cmif -> cm-list -> 数据库回退顺序组装评论来源信息。"""
+        # 重新打开评论面板/切换剧集后，下一页请求重新读取删除列表和统计。
+        self.comment_page_connection_manager.query_cache = None
         config = self.get_comment_config()
         record_path = os.path.join(metadata_path, '__COMMENT-RECORD__.json')
         record = self.read_comment_json(record_path, dict, {})
@@ -2772,17 +2844,20 @@ class ClassifyShowerModule:
         if perf:
             perf.step('解析路径和请求参数')
         #[DEBUG-END]
-        deleted_rpids = (
-            self.load_comment_deletelist(database_path, update_dir)
-            if (mark_deleted or only_deleted) and update_dir else set()
-        )
         if not update_dir:
             mark_deleted = False
             only_deleted = False
-        #[DEBUG-START] 性能调试代码，release时删掉
-        if perf:
-            perf.step('加载删除列表', rows=len(deleted_rpids))
-        #[DEBUG-END]
+        needs_deleted = mark_deleted or only_deleted
+        # 数据库连接及筛选准备缓存统一控制生命周期。仅缓存未命中才读取文件。
+        deleted_loader = (
+            lambda: self.load_comment_deletelist(database_path, update_dir)
+        ) if needs_deleted else None
+        query_scope = (
+            data.get('widgetId', ''),
+            CommentPageConnectionManager.normalize_path(metadata_path),
+            CommentPageConnectionManager.normalize_path(update_dir) if update_dir else '',
+            mark_deleted,
+        )
 
         result = load_comment_page_from_database(
             database_path, sort_by, page, page_size,
@@ -2792,7 +2867,8 @@ class ClassifyShowerModule:
             word_filter_enabled=word_filter_enabled,
             word_count=word_count,
             word_direction=word_direction,
-            deleted_rpids=deleted_rpids if (mark_deleted or only_deleted) else set(),
+            deleted_loader=deleted_loader,
+            query_scope=query_scope,
             connection_manager=self.comment_page_connection_manager,
             perf=perf,
         )

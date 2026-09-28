@@ -18,6 +18,9 @@ import colorama
 from bilibili_api import Credential, Danmaku, comment, video
 from bilibili_api.utils.aid_bvid_transformer import bvid2aid
 from bilibili_api.utils.network import Api, ResponseCodeException, get_aiohttp_session
+from bilibili_api.video import DanmakuClosedException
+
+
 
 colorama.init()
 
@@ -54,6 +57,9 @@ async def download_dm_by_bv(bv: str, p: int = 1, credential: Credential = None, 
         return None
     except ResponseCodeException as e:
         print(f"[Bilibili信息抓取模块] 稿件已失效: {e}")
+        return None
+    except DanmakuClosedException as e:
+        print_error(f"[Bilibili信息抓取模块] 视频弹幕已关闭: {e}")
         return None
 
     dmlist = []

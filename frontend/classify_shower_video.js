@@ -2586,12 +2586,9 @@ class CS_VideoPlayerWidget {
     currentCommentMetadataPath() {
         if (!this.currentEpisode) return '';
         const path = String(this.currentEpisode.path || '');
-        const slashIndex = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
-        const dotIndex = path.lastIndexOf('.');
-        const base = dotIndex > slashIndex ? path.slice(0, dotIndex) : path;
         const root = String(this.rootPath || '').replace(/[\\/]+$/, '');
         const separator = root.includes('\\') ? '\\' : '/';
-        return `${root}${separator}${base}.files`;
+        return `${root}${separator}${path}@meta`;
     }
 
     commentResourcePath(source) {

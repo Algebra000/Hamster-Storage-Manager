@@ -1992,8 +1992,7 @@ class ClassifyShowerModule:
         try:
             for f in os.listdir(root_path):
                 if any(f.lower().endswith(ext) for ext in video_extensions):
-                    video_base = os.path.splitext(f)[0]
-                    dm_dir = os.path.join(root_path, f'{video_base}.files')
+                    dm_dir = os.path.join(root_path, f'{f}@meta')
                     dmcf_path = os.path.join(dm_dir, 'rmcf.json')
                     if os.path.exists(dmcf_path):
                         has_danmaku = 1
@@ -2191,8 +2190,7 @@ class ClassifyShowerModule:
         anime['episodes'] = []
         for ep in video_files:
             video_name = ep['path']
-            video_base = os.path.splitext(video_name)[0]
-            dm_dir = os.path.join(root_path, f'{video_base}.files')
+            dm_dir = os.path.join(root_path, f'{video_name}@meta')
             dmcf_json_path = os.path.join(dm_dir, 'rmcf.json')
             dm_info_path = os.path.join(dm_dir, 'dm-info.json')
 
@@ -3034,8 +3032,7 @@ class ClassifyShowerModule:
             has_danmaku = False
             auto_seek_time = 0
             if root_path and video_path:
-                video_base = os.path.splitext(video_path)[0]
-                dm_dir = os.path.join(root_path, f'{video_base}.files')
+                dm_dir = os.path.join(root_path, f'{video_path}@meta')
                 dmcf_json_path = os.path.join(dm_dir, 'rmcf.json')
                 
                 if os.path.exists(dmcf_json_path):
@@ -3202,8 +3199,7 @@ class ClassifyShowerModule:
             success = False
             if root_path and video_path:
                 try:
-                    video_base = os.path.splitext(video_path)[0]
-                    dm_dir = os.path.join(root_path, f'{video_base}.files')
+                    dm_dir = os.path.join(root_path, f'{video_path}@meta')
                     
                     # 确保目录存在
                     os.makedirs(dm_dir, exist_ok=True)

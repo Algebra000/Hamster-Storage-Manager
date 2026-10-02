@@ -95,3 +95,6 @@ build/release/
 
 #项目外部文件
 show_tree.bat
+
+# 无关文档或参考文档
+docs/temp/

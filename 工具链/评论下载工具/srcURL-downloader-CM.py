@@ -1354,13 +1354,16 @@ def delta_paths(update_dir: Path, file_name: str) -> list:
 
 
 def next_delta_path(update_dir: Path, file_name: str) -> Path:
+    """在本来源现有最大增量编号后追加，避免补缺导致重放次序倒退。"""
     number = validate_comment_filename(file_name)
-    suffix = 1
-    while True:
-        path = Path(update_dir) / f"cm{number}-{suffix}.db"
-        if not path.exists():
-            return path
-        suffix += 1
+    pattern = re.compile(rf"^cm{number}-([1-9][0-9]*)\.db$")
+    max_suffix = 0
+    with os.scandir(update_dir) as entries:
+        for entry in entries:
+            match = pattern.fullmatch(entry.name)
+            if match and entry.is_file():
+                max_suffix = max(max_suffix, int(match.group(1)))
+    return Path(update_dir) / f"cm{number}-{max_suffix + 1}.db"
 
 
 def comment_deletelist_path(update_dir: Path, file_name: str) -> Path:

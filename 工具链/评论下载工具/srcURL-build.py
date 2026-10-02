@@ -214,7 +214,11 @@ def parse_time_range(range_str):
 def input_time_filter():
     filters = []
     while True:
-        line = input("想要保留什么时间段里的弹幕？请输入时间范围，只有这个范围里的弹幕才会被添加到dm.js\n时间范围格式 <小时>h<分钟>m<秒>s-<小时>h<分钟>m<秒>s，空输入默认保留所有弹幕。\n例如：0h30m0s-1h0m0s\n")
+        line = input(
+            "希望保留视频哪个时间段的弹幕？该段起点会对齐到本地视频 0 秒。\n"
+            "格式如：0h30m0s-1h0m0s（保留第30～60分钟，整体提前30分钟）。\n"
+            "直接回车保留全部且不移动时间。请输入：\n"
+        )
         if line == '':
             break
         parsed = parse_time_range(line)

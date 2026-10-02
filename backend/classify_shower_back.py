@@ -2385,6 +2385,8 @@ class ClassifyShowerModule:
                 for range_start, range_end in time_filter:
                     if range_start < start_time:
                         start_time = range_start
+                if start_time < 0:
+                    start_time = 0 # 如果不希望将选择器选择范围的最早时间对齐到 0，那就额外加入一个负值范围
                 dm['time'] = time - start_time
                 for range_start, range_end in time_filter:
                     if range_start <= time <= range_end:

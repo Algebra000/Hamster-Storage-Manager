@@ -95,6 +95,21 @@ class CommentPerformanceTrace:
                   f"(累计 {total:.2f} ms) {details}")
 #[DEBUG-END]
 
+#[DEBUG-START] 视频跳转耗时诊断，release时删掉
+class VideoSeekPerformanceTrace:
+    def __init__(self, request_id):
+        self.request_id = request_id
+        self.started = self.previous = time.perf_counter()
+
+    def step(self, label, **details):
+        now = time.perf_counter()
+        elapsed = (now - self.previous) * 1000
+        total = (now - self.started) * 1000
+        self.previous = now
+        print(f"[视频跳转耗时][{self.request_id}] {label}: {elapsed:.2f} ms "
+              f"(后端累计 {total:.2f} ms) {details}")
+#[DEBUG-END]
+
 class CommentPageConnectionManager:
     """缓存最近一个来源的只读连接，以及最近一组筛选条件的分页准备结果。"""
 
@@ -1606,6 +1621,14 @@ class ClassifyShowerModule:
         session = self.video_streams[websocket][widget_id]
         process = None
         stderr_task = None
+        #[DEBUG-START] 视频跳转耗时诊断，release时删掉
+        seek_perf = session.get('debugSeekPerformance')
+        debug_first_output = True
+        debug_first_init = True
+        debug_first_media = True
+        if seek_perf:
+            seek_perf.step('输出任务开始执行')
+        #[DEBUG-END]
         try:
             command = [ffmpeg_path, '-hide_banner', '-loglevel', 'warning']
             if start_time > 0:
@@ -1642,6 +1665,10 @@ class ClassifyShowerModule:
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
             session['process'] = process
+            #[DEBUG-START] 视频跳转耗时诊断，release时删掉
+            if seek_perf:
+                seek_perf.step('FFmpeg 进程创建完成', pid=process.pid)
+            #[DEBUG-END]
 
             async def collect_stderr():
                 chunks = []
@@ -1665,6 +1692,9 @@ class ClassifyShowerModule:
 
             async def send_segment(segment_type: str):
                 nonlocal sequence, first_fragment_time
+                #[DEBUG-START] 视频跳转耗时诊断，release时删掉
+                nonlocal debug_first_init, debug_first_media
+                #[DEBUG-END]
                 payload = b''.join(pending_boxes)
                 if not payload:
                     return
@@ -1690,6 +1720,14 @@ class ClassifyShowerModule:
                 await websocket.send(self.pack_video_chunk(
                     stream_id, widget_id, sequence, payload, segment_type
                 ))
+                #[DEBUG-START] 视频跳转耗时诊断，release时删掉
+                if seek_perf and segment_type == 'init' and debug_first_init:
+                    debug_first_init = False
+                    seek_perf.step('首个初始化段发送完成', bytes=len(payload))
+                if seek_perf and segment_type == 'media' and debug_first_media:
+                    debug_first_media = False
+                    seek_perf.step('首个媒体段发送完成', bytes=len(payload))
+                #[DEBUG-END]
                 sequence += 1
                 pending_boxes.clear()
                 pending_box_types.clear()
@@ -1710,6 +1748,11 @@ class ClassifyShowerModule:
                 chunk = await process.stdout.read(256 * 1024)
                 if not chunk:
                     break
+                #[DEBUG-START] 视频跳转耗时诊断，release时删掉
+                if seek_perf and debug_first_output:
+                    debug_first_output = False
+                    seek_perf.step('首次读到 FFmpeg 输出', bytes=len(chunk))
+                #[DEBUG-END]
                 mp4_buffer.extend(chunk)
                 await process_boxes(self.extract_mp4_boxes(mp4_buffer))
 
@@ -1732,12 +1775,20 @@ class ClassifyShowerModule:
                     streamId=stream_id, error=error_line
                 )
         except asyncio.CancelledError:
+            #[DEBUG-START] 视频跳转耗时诊断，release时删掉
+            if seek_perf:
+                seek_perf.step('输出任务取消')
+            #[DEBUG-END]
             await self.stop_ffmpeg_process(process)
             if process and process.stdout:
                 await process.stdout.read()
             raise
         except Exception as e:
             await self.stop_ffmpeg_process(process)
+            #[DEBUG-START] 视频跳转耗时诊断，release时删掉
+            if seek_perf:
+                seek_perf.step('输出任务失败', error=str(e))
+            #[DEBUG-END]
             if process and process.stdout:
                 await process.stdout.read()
             await self.send_stream_json(
@@ -1763,13 +1814,31 @@ class ClassifyShowerModule:
         widget_id = data.get('widgetId', '')
         requested_start_time = max(0.0, float(data.get('startTime', 0) or 0))
         start_time = requested_start_time
+        #[DEBUG-START] 视频跳转耗时诊断，release时删掉
+        seek_perf = None
+        if data.get('command') == 'SEEK_VIDEO_STREAM':
+            seek_perf = VideoSeekPerformanceTrace(data.get('debugSeekId') or uuid.uuid4().hex)
+            seek_perf.step('收到跳转请求', widgetId=widget_id, requestedTime=requested_start_time)
+        #[DEBUG-END]
         await self.cancel_video_stream(websocket, widget_id)
+        #[DEBUG-START] 视频跳转耗时诊断，release时删掉
+        if seek_perf:
+            seek_perf.step('旧任务与 FFmpeg 进程回收完成')
+        #[DEBUG-END]
         stream_id = uuid.uuid4().hex
         try:
             video_path = self.resolve_video_path(data.get('rootPath'), data.get('videoPath'))
             ffmpeg_path = self.get_ffmpeg_path()
+            #[DEBUG-START] 视频跳转耗时诊断，release时删掉
+            if seek_perf:
+                seek_perf.step('路径与 FFmpeg 配置检查完成')
+            #[DEBUG-END]
             loop = asyncio.get_running_loop()
             media_info = await loop.run_in_executor(None, self.probe_video, ffmpeg_path, video_path)
+            #[DEBUG-START] 视频跳转耗时诊断，release时删掉
+            if seek_perf:
+                seek_perf.step('媒体编码与时长探测完成')
+            #[DEBUG-END]
             if not media_info['videoSupported']:
                 print(
                     f"[分类展示模块] 不支持的视频编码: {media_info['videoCodec']}，"
@@ -1805,6 +1874,10 @@ class ClassifyShowerModule:
                         f"对齐到视频关键帧 {aligned_start_time:.3f}s"
                     )
                 start_time = aligned_start_time
+                #[DEBUG-START] 视频跳转耗时诊断，release时删掉
+                if seek_perf:
+                    seek_perf.step('关键帧定位完成', actualTime=start_time)
+                #[DEBUG-END]
             await self.send_stream_json(
                 websocket, 'VIDEO_STREAM_READY', widgetId=widget_id,
                 streamId=stream_id, startTime=start_time,
@@ -1813,6 +1886,10 @@ class ClassifyShowerModule:
                 **media_info
             )
             initial_buffer_until = start_time + self.VIDEO_STREAM_HIGH_WATER_SECONDS
+            #[DEBUG-START] 视频跳转耗时诊断，release时删掉
+            if seek_perf:
+                seek_perf.step('VIDEO_STREAM_READY 发送完成', streamId=stream_id)
+            #[DEBUG-END]
             if media_info['duration'] > 0:
                 initial_buffer_until = min(initial_buffer_until, media_info['duration'])
             session = {
@@ -1824,11 +1901,19 @@ class ClassifyShowerModule:
                 'flowEvent': asyncio.Event()
             }
             self.video_streams.setdefault(websocket, {})[widget_id] = session
+            #[DEBUG-START] 视频跳转耗时诊断，release时删掉
+            if seek_perf:
+                session['debugSeekPerformance'] = seek_perf
+            #[DEBUG-END]
             session['task'] = asyncio.create_task(self.stream_ffmpeg_output(
                 websocket, widget_id, stream_id, ffmpeg_path, video_path, start_time,
                 media_info.get('sourceAudioCodec'), media_info.get('audioTranscoded', False)
             ))
         except Exception as e:
+            #[DEBUG-START] 视频跳转耗时诊断，release时删掉
+            if seek_perf:
+                seek_perf.step('准备跳转失败', error=str(e))
+            #[DEBUG-END]
             await self.send_stream_json(
                 websocket, 'VIDEO_STREAM_ERROR', widgetId=widget_id,
                 streamId=stream_id, error=str(e)

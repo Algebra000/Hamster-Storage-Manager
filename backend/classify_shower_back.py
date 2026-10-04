@@ -8,6 +8,8 @@ import re
 import sqlite3
 import struct
 import subprocess
+from collections import OrderedDict
+from bisect import bisect_left
 from pathlib import Path
 from typing import List, Dict, Optional
 import time
@@ -96,6 +98,9 @@ class CommentPerformanceTrace:
 #[DEBUG-END]
 
 #[DEBUG-START] 视频跳转耗时诊断，release时删掉
+from contextvars import ContextVar
+VIDEO_SEEK_TRACE = ContextVar("video_seek_trace", default=None)
+
 class VideoSeekPerformanceTrace:
     def __init__(self, request_id):
         self.request_id = request_id
@@ -1190,6 +1195,12 @@ class ClassifyShowerModule:
         self.config = {}
         # 每个 WebSocket、每个播放器组件至多保留一个 FFmpeg 流任务。
         self.video_streams = {}
+        self.media_probe_cache = OrderedDict()
+        self.media_probe_tasks = {}
+        self.video_keyframe_cache = OrderedDict()
+        self.video_keyframe_tasks = {}
+        self.video_keyframe_status = OrderedDict()
+        self.video_index_semaphore = asyncio.Semaphore(1)
         # 正常评论页面查询复用最近一个数据库连接；切换来源或闲置后自动关闭。
         self.comment_page_connection_manager = CommentPageConnectionManager(
             idle_timeout=1800.0
@@ -1286,34 +1297,248 @@ class ClassifyShowerModule:
             # Windows 在比较不同盘符，或本地路径与 UNC 路径时会抛出 ValueError。
             return False
 
+    @staticmethod
+    def is_resolved_path_within(base_path, target_path):
+        """仅用于已经 realpath 解析的路径，避免重复访问网络文件系统。"""
+        base = os.path.normcase(base_path)
+        target = os.path.normcase(target_path)
+        try:
+            return os.path.commonpath([base, target]) == base
+        except ValueError:
+            return False
+
     def resolve_video_path(self, root_path: str, video_path: str) -> str:
         """解析并校验前端提交的视频路径，禁止越出已配置的资源目录。"""
+        #[DEBUG-START]
+        trace = VIDEO_SEEK_TRACE.get()
+        #[DEBUG-END]
         if not root_path or not video_path:
             raise ValueError("缺少视频路径")
 
         root_path = os.path.realpath(os.path.abspath(root_path))
+        #[DEBUG-START]
+        if trace:
+            trace.step('番剧根目录规范化完成')
+        #[DEBUG-END]
         full_path = os.path.realpath(os.path.abspath(os.path.join(root_path, video_path)))
-        if not self.is_path_within(root_path, full_path):
+        #[DEBUG-START]
+        if trace:
+            trace.step('视频完整路径规范化完成')
+        #[DEBUG-END]
+        if not self.is_resolved_path_within(root_path, full_path):
             raise ValueError("视频路径超出番剧目录")
 
+        #[DEBUG-START]
+        if trace:
+            trace.step('番剧目录边界检查完成')
+        #[DEBUG-END]
         allowed_roots = [
             os.path.realpath(os.path.abspath(path))
             for path in self.global_config.get('base_dir', [])
         ]
-        if allowed_roots and not any(self.is_path_within(path, full_path) for path in allowed_roots):
+        #[DEBUG-START]
+        if trace:
+            trace.step('配置资源根目录规范化完成')
+        #[DEBUG-END]
+        if allowed_roots and not any(self.is_resolved_path_within(path, full_path) for path in allowed_roots):
             raise ValueError("视频路径不在已配置的资源目录中")
+        #[DEBUG-START]
+        if trace:
+            trace.step('配置资源目录边界检查完成')
+        #[DEBUG-END]
         if not os.path.isfile(full_path):
             raise FileNotFoundError(f"视频文件不存在: {full_path}")
+        #[DEBUG-START]
+        if trace:
+            trace.step('视频文件存在性检查完成')
+        #[DEBUG-END]
         return full_path
 
     def get_ffmpeg_path(self) -> str:
+        #[DEBUG-START]
+        trace = VIDEO_SEEK_TRACE.get()
+        #[DEBUG-END]
         ffmpeg_path = self.config.get('video-config', {}).get('ffmpeg-path', '')
         if not ffmpeg_path:
             raise FileNotFoundError("未在 classify_shower_config.json 中配置 video-config.ffmpeg-path")
         ffmpeg_path = os.path.expandvars(os.path.expanduser(ffmpeg_path))
+        #[DEBUG-START]
+        if trace:
+            trace.step('FFmpeg 配置读取与变量展开完成')
+        #[DEBUG-END]
         if not os.path.isfile(ffmpeg_path):
             raise FileNotFoundError(f"FFmpeg 不存在: {ffmpeg_path}")
+        #[DEBUG-START]
+        if trace:
+            trace.step('FFmpeg 文件存在性检查完成')
+        #[DEBUG-END]
         return ffmpeg_path
+
+    VIDEO_METADATA_CACHE_LIMIT = 32
+
+    @staticmethod
+    def video_metadata_key(ffmpeg_path, video_path):
+        """文件或工具更新后自动失效；缓存不替代播放前的路径权限检查。"""
+        def signature(path):
+            info = os.stat(path)
+            return (os.path.normcase(os.path.abspath(path)), info.st_size,
+                    info.st_mtime_ns, info.st_ctime_ns)
+        return signature(video_path), signature(ffmpeg_path)
+
+    def store_video_metadata(self, cache, key, value):
+        # 同一路径的旧版本无需保留。
+        for old in list(cache):
+            if old[0][0] == key[0][0]:
+                del cache[old]
+        cache[key] = value
+        while len(cache) > self.VIDEO_METADATA_CACHE_LIMIT:
+            cache.popitem(last=False)
+
+    async def cached_probe_video(self, key, ffmpeg_path, video_path):
+        if key in self.media_probe_cache:
+            self.media_probe_cache.move_to_end(key)
+            return dict(self.media_probe_cache[key])
+        task = self.media_probe_tasks.get(key)
+        if task is None:
+            async def probe():
+                try:
+                    result = await asyncio.get_running_loop().run_in_executor(
+                        None, self.probe_video, ffmpeg_path, video_path)
+                    if self.video_metadata_key(ffmpeg_path, video_path) == key:
+                        self.store_video_metadata(self.media_probe_cache, key, dict(result))
+                    return result
+                finally:
+                    self.media_probe_tasks.pop(key, None)
+            task = asyncio.create_task(probe())
+            self.media_probe_tasks[key] = task
+            task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+        return dict(await asyncio.shield(task))
+
+    BACKWARD_INDEX_CONTAINERS = {'.mp4', '.m4v', '.mov', '.mkv', '.webm'}
+    FORWARD_INDEX_CONTAINERS = {'.ts', '.mts', '.m2ts'}
+
+    def video_index_state(self, key, video_path):
+        if Path(video_path).suffix.lower() not in (self.BACKWARD_INDEX_CONTAINERS | self.FORWARD_INDEX_CONTAINERS):
+            return 'unsupported-container'
+        if key in self.video_keyframe_cache:
+            return 'ready'
+        return self.video_keyframe_status.get(key, {}).get('state', 'not-started')
+
+    def ensure_video_keyframe_index(self, key, ffmpeg_path, video_path):
+        """后台顺序扫描压缩包；同一文件共享任务，最多一个扫描进程。"""
+        if self.video_index_state(key, video_path) == 'unsupported-container':
+            return
+        if key in self.video_keyframe_cache or key in self.video_keyframe_tasks:
+            return
+        previous = self.video_keyframe_status.get(key, {})
+        if previous.get('retryAfter', 0) > time.monotonic():
+            return
+        if len(self.video_keyframe_tasks) >= self.VIDEO_METADATA_CACHE_LIMIT:
+            self.store_video_metadata(self.video_keyframe_status, key, {'state': 'queue-full'})
+            return
+        self.store_video_metadata(self.video_keyframe_status, key, {'state': 'queued'})
+        self.video_keyframe_tasks[key] = asyncio.create_task(
+            self.build_video_keyframe_index(key, ffmpeg_path, video_path))
+
+    async def build_video_keyframe_index(self, key, ffmpeg_path, video_path):
+        process = None
+        #[DEBUG-START]
+        index_started = time.perf_counter()
+        #[DEBUG-END]
+        try:
+            async with self.video_index_semaphore:
+                self.store_video_metadata(self.video_keyframe_status, key, {'state': 'building'})
+                process = await asyncio.create_subprocess_exec(
+                    ffmpeg_path, '-hide_banner', '-nostdin', '-nostats',
+                    '-dump', '-debug_ts', '-i', video_path,
+                    '-map', '0:v:0', '-an', '-sn', '-dn', '-c:v', 'copy',
+                    '-f', 'null', 'pipe:1',
+                    stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+                frames = []
+                packet_is_key = False
+                first_video_index = None
+                # dump 给出关键帧标记，debug_ts 给出精度更高且经过输入起点归一化的 PTS。
+                async def scan():
+                    nonlocal packet_is_key, first_video_index
+                    while True:
+                        raw = await process.stderr.readline()
+                        if not raw:
+                            break
+                        line = raw.decode('utf-8', errors='replace').strip()
+                        if line.startswith('stream #'):
+                            packet_is_key = False
+                        elif line.startswith('keyframe='):
+                            packet_is_key = line == 'keyframe=1'
+                        elif line.startswith('demuxer+ffmpeg ->') and 'type:video' in line:
+                            stream = re.search(r'ist_index:(\d+)', line)
+                            if stream and first_video_index is None:
+                                first_video_index = stream.group(1)
+                            pts = re.search(r'pkt_pts_time:(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)', line, re.I)
+                            if (packet_is_key and pts and stream
+                                    and stream.group(1) == first_video_index):
+                                dts = re.search(r'pkt_dts_time:(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)', line, re.I)
+                                if dts:
+                                    frames.append((float(dts.group(1)), float(pts.group(1))))
+                    return await process.wait()
+                # 网络盘或异常文件不能无限占用扫描进程；失败时继续使用原定位方式。
+                code = await asyncio.wait_for(scan(), timeout=300)
+                if code != 0 or not frames:
+                    raise ValueError('未取得完整关键帧索引')
+                if self.video_metadata_key(ffmpeg_path, video_path) == key:
+                    self.store_video_metadata(self.video_keyframe_cache, key,
+                                              {'decode': tuple(sorted(set(frames))),
+                                               'presentation': tuple(sorted(set(pts for _, pts in frames)))})
+                    self.store_video_metadata(self.video_keyframe_status, key, {'state': 'ready'})
+                else:
+                    self.store_video_metadata(self.video_keyframe_status, key, {'state': 'file-changed'})
+                #[DEBUG-START]
+                print(f"[视频关键帧索引] 建立完成: {(time.perf_counter()-index_started)*1000:.2f} ms "
+                      f"关键帧数={len(frames)} 文件={video_path}")
+                #[DEBUG-END]
+        except asyncio.CancelledError:
+            self.store_video_metadata(self.video_keyframe_status, key, {'state': 'cancelled'})
+            raise
+        except Exception as e:
+            self.store_video_metadata(self.video_keyframe_status, key,
+                                      {'state': 'failed', 'error': str(e),
+                                       'retryAfter': time.monotonic() + 60})
+            #[DEBUG-START]
+            print(f"[视频关键帧索引] 建立失败，保留逐次定位: {e}")
+            #[DEBUG-END]
+            pass
+        finally:
+            await self.stop_ffmpeg_process(process, drain_stderr=True)
+            self.video_keyframe_tasks.pop(key, None)
+
+    async def cached_align_video_keyframe(self, key, ffmpeg_path, video_path, requested_time):
+        frames = self.video_keyframe_cache.get(key)
+        suffix = Path(video_path).suffix.lower()
+        if frames is not None and suffix in (self.BACKWARD_INDEX_CONTAINERS | self.FORWARD_INDEX_CONTAINERS):
+            self.video_keyframe_cache.move_to_end(key)
+            # TS 流复制按 PTS 丢弃请求时间之前的数据；带输入索引的容器
+            # 从前一个解码关键帧起步。分别索引，避免 B 帧的 DTS/PTS 混用。
+            if suffix in self.FORWARD_INDEX_CONTAINERS:
+                points = frames['presentation']
+                index = bisect_left(points, requested_time)
+                if index >= len(points):
+                    return requested_time
+                candidate = points[index]
+            else:
+                points = frames['decode']
+                index = bisect_left(points, (requested_time, float('-inf')))
+                if index > 0:
+                    candidate = points[index - 1][1]
+                elif points:
+                    candidate = points[0][1]
+                else:
+                    return requested_time
+            if 0.05 < candidate - requested_time <= 30:
+                return candidate
+            return requested_time
+        return await asyncio.get_running_loop().run_in_executor(
+            None, self.align_seek_to_video_keyframe, ffmpeg_path, video_path, requested_time)
 
     def probe_h264_codec_string(self, ffmpeg_path: str, video_path: str) -> Optional[str]:
         """从 FFmpeg 生成的 avcC 中提取准确的 RFC 6381 H.264 codec 字符串。"""
@@ -1563,22 +1788,45 @@ class ClassifyShowerModule:
         return min(starts) if starts else None
 
     @staticmethod
-    async def stop_ffmpeg_process(process):
-        """幂等地终止 FFmpeg，并在温和退出超时后强制回收。"""
-        if not process or process.returncode is not None:
+    async def stop_ffmpeg_process(process, drain_stderr=False):
+        """终止进程并同步排空 stdout，防止 PIPE 背压阻止 asyncio wait 完成。
+
+        调用方必须先停止 stdout 消费；stderr 仍有收集任务时由该任务排空。
+        """
+        if not process:
             return
+        async def drain_reader(reader):
+            if reader:
+                while await reader.read(64 * 1024):
+                    pass
+        async def drain_output():
+            readers = [process.stdout]
+            if drain_stderr:
+                readers.append(process.stderr)
+            await asyncio.gather(*(drain_reader(reader) for reader in readers))
+        drain_task = asyncio.create_task(drain_output())
         try:
-            process.terminate()
-        except ProcessLookupError:
-            return
-        try:
-            await asyncio.wait_for(process.wait(), timeout=2)
-        except asyncio.TimeoutError:
+            if process.returncode is None:
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
             try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-            await process.wait()
+                await asyncio.wait_for(process.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                #[DEBUG-START]
+                print(f"[视频进程回收] 终止等待超时，强制回收 pid={process.pid}")
+                #[DEBUG-END]
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                await process.wait()
+            await drain_task
+        finally:
+            if not drain_task.done():
+                drain_task.cancel()
+            await asyncio.gather(drain_task, return_exceptions=True)
 
     async def cancel_video_stream(self, websocket, widget_id: str):
         sessions = self.video_streams.get(websocket, {})
@@ -1777,11 +2025,9 @@ class ClassifyShowerModule:
         except asyncio.CancelledError:
             #[DEBUG-START] 视频跳转耗时诊断，release时删掉
             if seek_perf:
-                seek_perf.step('输出任务取消')
+                seek_perf.step('旧输出任务收到取消（含此前播放等待时间）')
             #[DEBUG-END]
             await self.stop_ffmpeg_process(process)
-            if process and process.stdout:
-                await process.stdout.read()
             raise
         except Exception as e:
             await self.stop_ffmpeg_process(process)
@@ -1789,8 +2035,6 @@ class ClassifyShowerModule:
             if seek_perf:
                 seek_perf.step('输出任务失败', error=str(e))
             #[DEBUG-END]
-            if process and process.stdout:
-                await process.stdout.read()
             await self.send_stream_json(
                 websocket, 'VIDEO_STREAM_ERROR', widgetId=widget_id,
                 streamId=stream_id, error=str(e)
@@ -1827,17 +2071,31 @@ class ClassifyShowerModule:
         #[DEBUG-END]
         stream_id = uuid.uuid4().hex
         try:
-            video_path = self.resolve_video_path(data.get('rootPath'), data.get('videoPath'))
-            ffmpeg_path = self.get_ffmpeg_path()
+            #[DEBUG-START]
+            trace_token = VIDEO_SEEK_TRACE.set(seek_perf)
+            #[DEBUG-END]
+            try:
+                video_path = self.resolve_video_path(data.get('rootPath'), data.get('videoPath'))
+                ffmpeg_path = self.get_ffmpeg_path()
+            finally:
+                #[DEBUG-START]
+                VIDEO_SEEK_TRACE.reset(trace_token)
+                #[DEBUG-END]
+                pass
             #[DEBUG-START] 视频跳转耗时诊断，release时删掉
             if seek_perf:
                 seek_perf.step('路径与 FFmpeg 配置检查完成')
             #[DEBUG-END]
-            loop = asyncio.get_running_loop()
-            media_info = await loop.run_in_executor(None, self.probe_video, ffmpeg_path, video_path)
+            cache_key = self.video_metadata_key(ffmpeg_path, video_path)
+            #[DEBUG-START]
+            probe_cache_hit = cache_key in self.media_probe_cache
+            if seek_perf:
+                seek_perf.step('媒体缓存文件签名检查完成', cacheHit=probe_cache_hit)
+            #[DEBUG-END]
+            media_info = await self.cached_probe_video(cache_key, ffmpeg_path, video_path)
             #[DEBUG-START] 视频跳转耗时诊断，release时删掉
             if seek_perf:
-                seek_perf.step('媒体编码与时长探测完成')
+                seek_perf.step('媒体编码与时长探测完成', cacheHit=probe_cache_hit)
             #[DEBUG-END]
             if not media_info['videoSupported']:
                 print(
@@ -1860,10 +2118,13 @@ class ClassifyShowerModule:
             if media_info['duration'] > 0:
                 start_time = min(start_time, max(0.0, media_info['duration'] - 0.1))
             if start_time > 0:
-                aligned_start_time = await loop.run_in_executor(
-                    None, self.align_seek_to_video_keyframe,
-                    ffmpeg_path, video_path, start_time
-                )
+                #[DEBUG-START]
+                index_state = self.video_index_state(cache_key, video_path)
+                index_cache_hit = index_state == 'ready'
+                index_error = self.video_keyframe_status.get(cache_key, {}).get('error')
+                #[DEBUG-END]
+                aligned_start_time = await self.cached_align_video_keyframe(
+                    cache_key, ffmpeg_path, video_path, start_time)
                 if media_info['duration'] > 0:
                     aligned_start_time = min(
                         aligned_start_time, max(0.0, media_info['duration'] - 0.1)
@@ -1876,7 +2137,8 @@ class ClassifyShowerModule:
                 start_time = aligned_start_time
                 #[DEBUG-START] 视频跳转耗时诊断，release时删掉
                 if seek_perf:
-                    seek_perf.step('关键帧定位完成', actualTime=start_time)
+                    seek_perf.step('关键帧定位完成', actualTime=start_time, cacheHit=index_cache_hit,
+                                   indexState=index_state, indexError=index_error)
                 #[DEBUG-END]
             await self.send_stream_json(
                 websocket, 'VIDEO_STREAM_READY', widgetId=widget_id,
@@ -1905,6 +2167,7 @@ class ClassifyShowerModule:
             if seek_perf:
                 session['debugSeekPerformance'] = seek_perf
             #[DEBUG-END]
+            self.ensure_video_keyframe_index(cache_key, ffmpeg_path, video_path)
             session['task'] = asyncio.create_task(self.stream_ffmpeg_output(
                 websocket, widget_id, stream_id, ffmpeg_path, video_path, start_time,
                 media_info.get('sourceAudioCodec'), media_info.get('audioTranscoded', False)
@@ -3037,6 +3300,12 @@ class ClassifyShowerModule:
         for websocket, sessions in list(self.video_streams.items()):
             for widget_id in list(sessions.keys()):
                 await self.cancel_video_stream(websocket, widget_id)
+        metadata_tasks = list(self.video_keyframe_tasks.values()) + list(self.media_probe_tasks.values())
+        for task in metadata_tasks:
+            task.cancel()
+        await asyncio.gather(*metadata_tasks, return_exceptions=True)
+        self.video_keyframe_cache.clear()
+        self.media_probe_cache.clear()
         self.comment_page_connection_manager.close()
         db_conn = getattr(self, 'db_conn', None)
         if db_conn is not None:

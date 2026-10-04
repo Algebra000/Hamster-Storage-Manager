@@ -6,6 +6,188 @@
 * 文档详见 frame-default.md
 */
 
+/**
+ * 通用提示框。durationMs 为 0 时持续显示；返回 { close() }。
+ * 内部元素、队列及计时器封装在闭包中，只导出标准接口。
+ */
+(() => {
+    let noticeStackMaxHeight = 320; // px，后续设置功能统一调整此值。
+    const gap = 8;
+    const animationMs = 200;
+    const notices = [];
+    let layer = null;
+    let resizeObserver = null;
+    let layoutFrame = null;
+
+    function layout() {
+        layoutFrame = null;
+        if (!layer) return;
+        const heights = notices.map(item => item.card.getBoundingClientRect().height);
+        const total = heights.reduce((sum, height) => sum + height + gap, -gap);
+        const height = Math.min(Math.max(0, total), noticeStackMaxHeight,
+            Math.max(0, window.innerHeight - 24));
+        layer.style.height = `${height}px`;
+        let top = 0;
+        for (const [index, item] of notices.entries()) {
+            item.row.style.bottom = `${height - top - heights[index]}px`;
+            top += heights[index] + gap;
+        }
+    }
+
+    function scheduleLayout() {
+        if (layoutFrame === null) layoutFrame = requestAnimationFrame(layout);
+    }
+
+    function ensureLayer() {
+        if (layer) return;
+        layer = document.createElement('div');
+        layer.className = 'frame_notice_stack';
+        Object.assign(layer.style, {
+            position: 'fixed', left: '0', bottom: '12px', width: '50vw', height: '0',
+            overflow: 'hidden', pointerEvents: 'none', zIndex: '2147483647'
+        });
+        document.body.appendChild(layer);
+        window.addEventListener('resize', scheduleLayout);
+        if (typeof ResizeObserver !== 'undefined') {
+            resizeObserver = new ResizeObserver(scheduleLayout);
+        }
+    }
+
+    function remove(item) {
+        if (item.closed) return;
+        item.closed = true;
+        clearTimeout(item.timer);
+        if (item.ringAnimation) item.ringAnimation.pause();
+        item.card.style.opacity = '0';
+        item.card.style.transform = 'translateX(-100%)';
+        item.card.style.pointerEvents = 'none';
+        setTimeout(() => {
+            if (item.ringAnimation) item.ringAnimation.cancel();
+            if (resizeObserver) resizeObserver.unobserve(item.card);
+            item.row.remove();
+            notices.splice(notices.indexOf(item), 1);
+            layout();
+            if (!notices.length) {
+                if (layoutFrame !== null) cancelAnimationFrame(layoutFrame);
+                layoutFrame = null;
+                if (resizeObserver) resizeObserver.disconnect();
+                resizeObserver = null;
+                window.removeEventListener('resize', scheduleLayout);
+                layer.remove();
+                layer = null;
+            }
+        }, animationMs);
+    }
+
+    window.frame_show_notice = function (text, durationMs = 5000,
+        backgroundColor = '#FFFEFE', showCloseButton = true, textColor = null) {
+        if (!document.body) throw new Error('frame_show_notice：请在页面 DOM 就绪后调用');
+        if (!Number.isFinite(durationMs) || durationMs < 0 || durationMs > 2147483647) {
+            throw new TypeError('frame_show_notice：显示时长须为有效的非负毫秒数');
+        }
+        if (typeof backgroundColor !== 'string' || !CSS.supports('color', backgroundColor)) {
+            throw new TypeError('frame_show_notice：背景色须为有效 CSS 颜色');
+        }
+        if (textColor !== null && (typeof textColor !== 'string' || !CSS.supports('color', textColor))) {
+            throw new TypeError('frame_show_notice：文本颜色须为有效 CSS 颜色或 null');
+        }
+        ensureLayer();
+        const row = document.createElement('div');
+        row.className = 'frame_notice_row';
+        Object.assign(row.style, {
+            position: 'absolute', left: '0', width: '100%',
+            transition: `bottom ${animationMs}ms ease`
+        });
+        const card = document.createElement('div');
+        card.className = 'frame_notice_card';
+        card.setAttribute('role', 'status');
+        Object.assign(card.style, {
+            position: 'relative', boxSizing: 'border-box', width: 'max-content',
+            minWidth: 'min(240px, 100%)', maxWidth: '100%', padding: '6px 20px 6px 56px',
+            borderRadius: '0 6px 6px 0', backgroundColor, color: '#202020',
+            fontSize: '15px', lineHeight: '1.3', whiteSpace: 'pre-wrap',
+            overflowWrap: 'anywhere', pointerEvents: 'auto',
+            opacity: '1', transform: 'translateX(-100%)',
+            transition: `transform ${animationMs}ms ease-out, opacity ${animationMs}ms ease-out`
+        });
+        const message = document.createElement('span');
+        message.textContent = String(text);
+        card.appendChild(message);
+        row.appendChild(card);
+        layer.appendChild(row);
+        // 显式颜色优先；未指定时保留原有自动对比色。
+        const rgb = getComputedStyle(card).backgroundColor.match(/[\d.]+/g);
+        if (textColor !== null) {
+            card.style.color = textColor;
+        } else if (rgb && rgb.length >= 3 && (rgb.length < 4 || Number(rgb[3]) >= 0.8)) {
+            const luminance = 0.299 * Number(rgb[0]) + 0.587 * Number(rgb[1]) + 0.114 * Number(rgb[2]);
+            card.style.color = luminance < 140 ? '#FFFFFF' : '#202020';
+        }
+        const item = { row, card, closed: false, timer: null, ringAnimation: null };
+        const svgNS = 'http://www.w3.org/2000/svg';
+        const control = document.createElement(showCloseButton ? 'button' : 'span');
+        control.className = 'frame_notice_close';
+        if (showCloseButton) {
+            control.type = 'button';
+            control.setAttribute('aria-label', '关闭通知');
+            control.addEventListener('click', () => remove(item));
+        } else {
+            control.setAttribute('aria-hidden', 'true');
+        }
+        Object.assign(control.style, {
+            position: 'absolute', left: '10px', top: '50%', transform: 'translateY(-50%)',
+            width: '30px', height: '30px', padding: '0', margin: '0', border: '0',
+            boxSizing: 'border-box', display: 'block',
+            background: 'transparent', color: 'inherit',
+            cursor: showCloseButton ? 'pointer' : 'default'
+        });
+        const svg = document.createElementNS(svgNS, 'svg');
+        svg.setAttribute('viewBox', '0 0 30 30');
+        svg.setAttribute('width', '30');
+        svg.setAttribute('height', '30');
+        svg.setAttribute('aria-hidden', 'true');
+        const circle = document.createElementNS(svgNS, 'circle');
+        const circumference = 2 * Math.PI * 12;
+        for (const [key, value] of Object.entries({
+            cx: 15, cy: 15, r: 12, fill: 'none', stroke: 'currentColor',
+            'stroke-width': 2, 'stroke-linecap': 'round',
+            transform: 'rotate(-90 15 15)'
+        })) circle.setAttribute(key, String(value));
+        circle.style.strokeDasharray = `${circumference}`;
+        circle.style.strokeDashoffset = '0';
+        svg.appendChild(circle);
+        if (showCloseButton) {
+            const cross = document.createElementNS(svgNS, 'path');
+            cross.setAttribute('d', 'M11 11L19 19M19 11L11 19');
+            cross.setAttribute('stroke', 'currentColor');
+            cross.setAttribute('stroke-width', '1.8');
+            cross.setAttribute('stroke-linecap', 'round');
+            svg.appendChild(cross);
+        }
+        control.appendChild(svg);
+        card.appendChild(control);
+        notices.unshift(item);
+        layout();
+        if (resizeObserver) resizeObserver.observe(card);
+        // 先提交屏幕外位置，再启动滑入；倒计时与圆环从同一时刻开始。
+        void card.offsetWidth;
+        card.style.transform = 'translateX(0)';
+        if (durationMs > 0) {
+            item.ringAnimation = circle.animate([
+                { strokeDashoffset: '0' }, { strokeDashoffset: String(circumference) }
+            ], { duration: durationMs, easing: 'linear', fill: 'forwards' });
+            item.timer = setTimeout(() => {
+                item.ringAnimation.cancel();
+                item.ringAnimation = null;
+                circle.style.strokeDasharray = `0 ${circumference}`;
+                circle.style.strokeDashoffset = '0';
+                remove(item);
+            }, durationMs);
+        }
+        return Object.freeze({ close: () => remove(item) });
+    };
+})();
+
 // 固定区域数量
 const BLOCK_COUNT = 3;
 

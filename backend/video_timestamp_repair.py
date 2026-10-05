@@ -1,5 +1,7 @@
 """普通 MP4 的无损流式时间戳修复；只修改内存中的 fMP4 分片。"""
 import asyncio
+import contextvars
+from functools import partial
 import os
 import re
 import struct
@@ -8,6 +10,14 @@ import subprocess
 
 MAX_MOOV_BYTES = 64 * 1024 * 1024
 MAX_SAMPLES = 2_000_000
+
+
+async def run_in_thread(func, *args, **kwargs):
+    """在线程池中执行同步操作并传递上下文，兼容 Python 3.8。"""
+    loop = asyncio.get_running_loop()
+    context = contextvars.copy_context()
+    call = partial(context.run, func, *args, **kwargs)
+    return await loop.run_in_executor(None, call)
 
 
 def boxes(data):
@@ -192,7 +202,8 @@ class MP4StreamTimestampRepair:
         if not self.keys or any(n < 0 or n >= len(self.positions) for n in self.keys):
             raise ValueError('MP4 关键帧样本索引无效')
         self.vfr = max(self.durations) - min(self.durations) > 1
-        self.queue = asyncio.Queue(maxsize=128)
+        # 构造函数在线程池中读取元数据；Python 3.8 的 Queue 必须在事件循环线程创建。
+        self.queue = None
         self.pending = {}
         self.process = self.reader = None
         self.error = None
@@ -203,6 +214,7 @@ class MP4StreamTimestampRepair:
         self.close_task = None
 
     async def start(self, ffmpeg, seconds):
+        self.queue = asyncio.Queue(maxsize=128)
         self.seek_time = seconds
         command = [ffmpeg, '-hide_banner', '-nostdin', '-nostats', '-threads', '1',
                    '-ignore_editlist', '1', '-noaccurate_seek']
@@ -237,13 +249,15 @@ class MP4StreamTimestampRepair:
                 code = await self.process.wait()
                 if code:
                     raise ValueError('FFmpeg 显示顺序解码失败：' + ''.join(tail)[-1500:])
+            except asyncio.CancelledError:
+                # 取消时直接退出，避免满队列上的结束标记写入阻塞回收。
+                raise
             except Exception as error:
                 self.error = error
-            finally:
-                if not asyncio.current_task().cancelling():
-                    await self.queue.put(None)
+            # 正常结束和解码错误都通知消费者；此处等待同样允许被取消。
+            await self.queue.put(None)
         self.reader = asyncio.create_task(read_frames())
-        first = await asyncio.wait_for(self.queue.get(), 30)
+        first = await self.next_frame()
         if first is None:
             raise self.error or ValueError('无法取得请求位置的首个显示帧')
         number, index = first
@@ -261,9 +275,23 @@ class MP4StreamTimestampRepair:
         mdhd = child(child(track, b'mdia'), b'mdhd')
         self.output_timescale = u32(mdhd, 20 if mdhd[0] == 1 else 12)
 
+    async def next_frame(self):
+        """等待一条显示帧记录，同时可靠传递 Python 3.8 下的外部取消。"""
+        reader = asyncio.create_task(self.queue.get())
+        try:
+            # 避免旧版 wait_for 在子任务刚完成时吞掉外部取消的竞争条件。
+            done, _ = await asyncio.wait({reader}, timeout=30)
+            if not done:
+                raise asyncio.TimeoutError()
+            return reader.result()
+        finally:
+            if not reader.done():
+                reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+
     async def display_number(self, index):
         while index not in self.pending:
-            frame = await asyncio.wait_for(self.queue.get(), 30)
+            frame = await self.next_frame()
             if frame is None:
                 raise self.error or ValueError('显示顺序解码提前结束，无法修复当前分片')
             number, sample = frame
@@ -326,7 +354,7 @@ class MP4StreamTimestampRepair:
                             with open(self.source, 'rb') as source:
                                 source.seek(sample_position)
                                 return source.read(size)
-                        original = await asyncio.to_thread(read_original_sample)
+                        original = await run_in_thread(read_original_sample)
                         if payload[data_offset:data_offset + size] != original:
                             raise ValueError('流复制与解码器未从同一个视频样本开始')
                         self.started = True
@@ -392,7 +420,7 @@ class MP4StreamTimestampRepair:
         #[DEBUG-START]
         if trace:
             trace.step('辅助解码读取任务开始回收', pid=self.process.pid if self.process else None,
-                       queuedFrames=self.queue.qsize())
+                       queuedFrames=self.queue.qsize() if self.queue is not None else 0)
         #[DEBUG-END]
         if self.reader:
             await asyncio.gather(self.reader, return_exceptions=True)

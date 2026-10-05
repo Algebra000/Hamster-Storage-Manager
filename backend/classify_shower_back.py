@@ -24,7 +24,7 @@ from urllib.request import Request, urlopen
 
 # 导入文件类型列表
 from config.file_type import video_type_list
-from video_timestamp_repair import MP4StreamTimestampRepair
+from video_timestamp_repair import MP4StreamTimestampRepair, run_in_thread
 
 
 COMMENT_DATABASE_SCHEMA_VERSION = "v1.1"
@@ -2203,7 +2203,7 @@ class ClassifyShowerModule:
             #[DEBUG-END]
             policy = self.read_video_playback_policy(video_path)
             if policy['force-buffered-playback']:
-                timestamp_repair = await asyncio.to_thread(MP4StreamTimestampRepair, video_path)
+                timestamp_repair = await run_in_thread(MP4StreamTimestampRepair, video_path)
                 if not is_current():
                     return
             timestamp_result = 'streaming' if timestamp_repair else 'not-requested'

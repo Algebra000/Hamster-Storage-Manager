@@ -24,6 +24,7 @@ from urllib.request import Request, urlopen
 
 # 导入文件类型列表
 from config.file_type import video_type_list
+from video_timestamp_repair import MP4StreamTimestampRepair
 
 
 COMMENT_DATABASE_SCHEMA_VERSION = "v1.1"
@@ -1195,6 +1196,8 @@ class ClassifyShowerModule:
         self.config = {}
         # 每个 WebSocket、每个播放器组件至多保留一个 FFmpeg 流任务。
         self.video_streams = {}
+        self.video_preparations = {}
+        self.video_request_tasks = {}
         self.media_probe_cache = OrderedDict()
         self.media_probe_tasks = {}
         self.video_keyframe_cache = OrderedDict()
@@ -1373,6 +1376,33 @@ class ClassifyShowerModule:
             trace.step('FFmpeg 文件存在性检查完成')
         #[DEBUG-END]
         return ffmpeg_path
+
+    def read_video_playback_policy(self, video_path):
+        """仅明确的 JSON false 触发普通 MP4 修复；读取失败保持原播放策略。"""
+        force = False
+        status = 'not-mp4'
+        if Path(video_path).suffix.lower() == '.mp4':
+            status = 'missing-or-unreadable'
+            metadata_path = os.path.realpath(video_path + '@meta')
+            meta_file = os.path.realpath(os.path.join(metadata_path, '__meta'))
+            # 元数据符号链接同样不能绕过视频所在资源目录边界。
+            if self.is_path_within(os.path.dirname(video_path), meta_file):
+                try:
+                    if os.path.getsize(meta_file) > 65536:
+                        raise ValueError('__meta 文件超过读取大小上限')
+                    with open(meta_file, 'r', encoding='utf-8-sig') as source:
+                        data = json.load(source)
+                    if isinstance(data, dict):
+                        value = data.get('mp4-timestamps-valid')
+                        force = value is False
+                        status = 'false' if force else 'default'
+                except (OSError, ValueError):
+                    pass
+        #[DEBUG-START]
+        print(f'[视频播放策略] 元数据状态={status} 修复缓冲播放={force} 文件={video_path}')
+        #[DEBUG-END]
+        return {'force-buffered-playback': force,
+                'buffered-playback-reason': 'mp4-timestamps-invalid' if force else None}
 
     VIDEO_METADATA_CACHE_LIMIT = 32
 
@@ -1788,13 +1818,17 @@ class ClassifyShowerModule:
         return min(starts) if starts else None
 
     @staticmethod
-    async def stop_ffmpeg_process(process, drain_stderr=False):
+    async def stop_ffmpeg_process(process, drain_stderr=False, trace=None):
         """终止进程并同步排空 stdout，防止 PIPE 背压阻止 asyncio wait 完成。
 
         调用方必须先停止 stdout 消费；stderr 仍有收集任务时由该任务排空。
         """
         if not process:
             return
+        #[DEBUG-START]
+        if trace:
+            trace.step('主 FFmpeg 进程开始回收', pid=process.pid, returncode=process.returncode)
+        #[DEBUG-END]
         async def drain_reader(reader):
             if reader:
                 while await reader.read(64 * 1024):
@@ -1822,26 +1856,73 @@ class ClassifyShowerModule:
                 except ProcessLookupError:
                     pass
                 await process.wait()
+            #[DEBUG-START]
+            if trace:
+                trace.step('主 FFmpeg 退出等待完成', returncode=process.returncode)
+            #[DEBUG-END]
             await drain_task
+            #[DEBUG-START]
+            if trace:
+                trace.step('主 FFmpeg 输出管道排空完成')
+            #[DEBUG-END]
         finally:
             if not drain_task.done():
                 drain_task.cancel()
             await asyncio.gather(drain_task, return_exceptions=True)
 
-    async def cancel_video_stream(self, websocket, widget_id: str):
+    async def cancel_video_stream(self, websocket, widget_id: str, cleanup_trace=None):
+        requests = self.video_request_tasks.get(websocket, {})
+        request_task = requests.get(widget_id)
+        if request_task and request_task is not asyncio.current_task():
+            requests.pop(widget_id, None)
+            request_task.cancel()
+            await asyncio.gather(request_task, return_exceptions=True)
+        if not requests:
+            self.video_request_tasks.pop(websocket, None)
+        pending = self.video_preparations.get(websocket, {})
+        pending.pop(widget_id, None)
+        if not pending:
+            self.video_preparations.pop(websocket, None)
         sessions = self.video_streams.get(websocket, {})
         session = sessions.pop(widget_id, None)
         if session:
             task = session.get('task')
             process = session.get('process')
+            timestamp_repair = session.get('timestampRepair')
+            #[DEBUG-START]
+            session['cancelTrace'] = cleanup_trace
+            if cleanup_trace:
+                cleanup_trace.step('旧输出任务开始取消', pid=process.pid if process else None,
+                                   taskDone=task.done() if task else True)
+            #[DEBUG-END]
+            # 先给两个写入者发出停止请求，不把它们留到输出任务 finally 才终止。
             if task and task is not asyncio.current_task():
                 task.cancel()
+            if timestamp_repair:
+                timestamp_repair.request_stop()
+            if process and process.returncode is None:
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
+            #[DEBUG-START]
+            if cleanup_trace:
+                cleanup_trace.step('旧主进程与辅助进程终止请求已发出')
+            #[DEBUG-END]
+            if task and task is not asyncio.current_task():
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
             else:
                 await self.stop_ffmpeg_process(process)
+            # 输出任务可能尚未开始执行，不能只依赖它的 finally 回收辅助进程。
+            if timestamp_repair:
+                await timestamp_repair.close(cleanup_trace)
+            #[DEBUG-START]
+            if cleanup_trace:
+                cleanup_trace.step('旧输出任务回收完成')
+            #[DEBUG-END]
         if not sessions:
             self.video_streams.pop(websocket, None)
 
@@ -1867,6 +1948,7 @@ class ClassifyShowerModule:
                                    source_audio_codec: Optional[str] = None,
                                    transcode_audio: bool = False):
         session = self.video_streams[websocket][widget_id]
+        timestamp_repair = session.get('timestampRepair')
         process = None
         stderr_task = None
         #[DEBUG-START] 视频跳转耗时诊断，release时删掉
@@ -1879,13 +1961,18 @@ class ClassifyShowerModule:
         #[DEBUG-END]
         try:
             command = [ffmpeg_path, '-hide_banner', '-loglevel', 'warning']
+            if timestamp_repair:
+                command.extend(['-ignore_editlist', '1', '-noaccurate_seek'])
             if start_time > 0:
-                command.extend(['-ss', f'{start_time:.3f}'])
+                seek_time = timestamp_repair.seek_time if timestamp_repair else start_time
+                command.extend(['-ss', f'{seek_time:.9f}'])
             command.extend([
                 '-i', video_path,
                 '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn',
                 '-c:v', 'copy'
             ])
+            if timestamp_repair:
+                command.extend(['-copypriorss', '1'])
             if transcode_audio:
                 # 音频转码远轻于视频转码；不加 -re，让 FFmpeg 按缓冲水位尽快产出 AAC。
                 # 统一采样到 48 kHz AAC-LC，避免 AMR 这类低采样率输入触发 AAC 码率上限。
@@ -1947,6 +2034,8 @@ class ClassifyShowerModule:
                 if not payload:
                     return
                 if segment_type == 'init':
+                    if timestamp_repair:
+                        timestamp_repair.init_segment(payload)
                     track_timescales.update(self.read_mp4_track_timescales(payload))
                     if not track_timescales:
                         raise ValueError('无法从 fMP4 初始化段读取轨道 timescale')
@@ -1965,6 +2054,8 @@ class ClassifyShowerModule:
                         if fragment_time_in_video <= session['bufferUntil'] + 0.05:
                             continue
                         await flow_event.wait()
+                    if timestamp_repair:
+                        payload = await timestamp_repair.repair_segment(payload)
                 await websocket.send(self.pack_video_chunk(
                     stream_id, widget_id, sequence, payload, segment_type
                 ))
@@ -2027,10 +2118,18 @@ class ClassifyShowerModule:
             if seek_perf:
                 seek_perf.step('旧输出任务收到取消（含此前播放等待时间）')
             #[DEBUG-END]
-            await self.stop_ffmpeg_process(process)
+            await self.stop_ffmpeg_process(process,
+                #[DEBUG-START]
+                trace=session.get('cancelTrace')
+                #[DEBUG-END]
+            )
             raise
         except Exception as e:
-            await self.stop_ffmpeg_process(process)
+            await self.stop_ffmpeg_process(process,
+                #[DEBUG-START]
+                trace=session.get('cancelTrace')
+                #[DEBUG-END]
+            )
             #[DEBUG-START] 视频跳转耗时诊断，release时删掉
             if seek_perf:
                 seek_perf.step('输出任务失败', error=str(e))
@@ -2040,6 +2139,12 @@ class ClassifyShowerModule:
                 streamId=stream_id, error=str(e)
             )
         finally:
+            if timestamp_repair:
+                await timestamp_repair.close(
+                    #[DEBUG-START]
+                    trace=session.get('cancelTrace')
+                    #[DEBUG-END]
+                )
             if stderr_task and not stderr_task.done():
                 stderr_task.cancel()
             if stderr_task:
@@ -2064,12 +2169,22 @@ class ClassifyShowerModule:
             seek_perf = VideoSeekPerformanceTrace(data.get('debugSeekId') or uuid.uuid4().hex)
             seek_perf.step('收到跳转请求', widgetId=widget_id, requestedTime=requested_start_time)
         #[DEBUG-END]
-        await self.cancel_video_stream(websocket, widget_id)
+        await self.cancel_video_stream(websocket, widget_id,
+            #[DEBUG-START]
+            cleanup_trace=seek_perf
+            #[DEBUG-END]
+        )
         #[DEBUG-START] 视频跳转耗时诊断，release时删掉
         if seek_perf:
             seek_perf.step('旧任务与 FFmpeg 进程回收完成')
         #[DEBUG-END]
         stream_id = uuid.uuid4().hex
+        preparation = {}
+        timestamp_repair = None
+        repair_handed_over = False
+        self.video_preparations.setdefault(websocket, {})[widget_id] = preparation
+        def is_current():
+            return self.video_preparations.get(websocket, {}).get(widget_id) is preparation
         try:
             #[DEBUG-START]
             trace_token = VIDEO_SEEK_TRACE.set(seek_perf)
@@ -2086,6 +2201,13 @@ class ClassifyShowerModule:
             if seek_perf:
                 seek_perf.step('路径与 FFmpeg 配置检查完成')
             #[DEBUG-END]
+            policy = self.read_video_playback_policy(video_path)
+            if policy['force-buffered-playback']:
+                timestamp_repair = await asyncio.to_thread(MP4StreamTimestampRepair, video_path)
+                if not is_current():
+                    return
+            timestamp_result = 'streaming' if timestamp_repair else 'not-requested'
+            preparation['mediaPath'] = video_path
             cache_key = self.video_metadata_key(ffmpeg_path, video_path)
             #[DEBUG-START]
             probe_cache_hit = cache_key in self.media_probe_cache
@@ -2093,6 +2215,8 @@ class ClassifyShowerModule:
                 seek_perf.step('媒体缓存文件签名检查完成', cacheHit=probe_cache_hit)
             #[DEBUG-END]
             media_info = await self.cached_probe_video(cache_key, ffmpeg_path, video_path)
+            if not is_current():
+                return
             #[DEBUG-START] 视频跳转耗时诊断，release时删掉
             if seek_perf:
                 seek_perf.step('媒体编码与时长探测完成', cacheHit=probe_cache_hit)
@@ -2107,6 +2231,7 @@ class ClassifyShowerModule:
                     streamId=stream_id, mediaType='video',
                     videoPath=data.get('videoPath'), videoCodec=media_info['videoCodec'],
                     supportedVideoCodecs=sorted(self.SUPPORTED_VIDEO_CODECS),
+                    requestId=data.get('requestId'),
                     message='不支持该视频的视频编码格式'
                 )
                 return
@@ -2117,7 +2242,13 @@ class ClassifyShowerModule:
                 )
             if media_info['duration'] > 0:
                 start_time = min(start_time, max(0.0, media_info['duration'] - 0.1))
-            if start_time > 0:
+            if timestamp_repair:
+                start_time = await timestamp_repair.start(ffmpeg_path, start_time)
+                #[DEBUG-START]
+                if seek_perf:
+                    seek_perf.step('修复流关键帧定位完成', actualTime=start_time)
+                #[DEBUG-END]
+            elif start_time > 0:
                 #[DEBUG-START]
                 index_state = self.video_index_state(cache_key, video_path)
                 index_cache_hit = index_state == 'ready'
@@ -2140,13 +2271,20 @@ class ClassifyShowerModule:
                     seek_perf.step('关键帧定位完成', actualTime=start_time, cacheHit=index_cache_hit,
                                    indexState=index_state, indexError=index_error)
                 #[DEBUG-END]
+            if not is_current():
+                return
             await self.send_stream_json(
                 websocket, 'VIDEO_STREAM_READY', widgetId=widget_id,
+                videoPath=data.get('videoPath'), requestId=data.get('requestId'),
+                playbackMode='timestamp-repair' if policy['force-buffered-playback'] else 'remux',
+                timestampResult=timestamp_result,
                 streamId=stream_id, startTime=start_time,
                 requestedStartTime=requested_start_time,
                 bufferHighWaterSeconds=self.VIDEO_STREAM_HIGH_WATER_SECONDS,
                 **media_info
             )
+            if not is_current():
+                return
             initial_buffer_until = start_time + self.VIDEO_STREAM_HIGH_WATER_SECONDS
             #[DEBUG-START] 视频跳转耗时诊断，release时删掉
             if seek_perf:
@@ -2156,6 +2294,8 @@ class ClassifyShowerModule:
                 initial_buffer_until = min(initial_buffer_until, media_info['duration'])
             session = {
                 'streamId': stream_id,
+                'mediaPath': video_path,
+                'timestampRepair': timestamp_repair,
                 'process': None,
                 'task': None,
                 'duration': media_info['duration'],
@@ -2163,25 +2303,38 @@ class ClassifyShowerModule:
                 'flowEvent': asyncio.Event()
             }
             self.video_streams.setdefault(websocket, {})[widget_id] = session
+            repair_handed_over = True
             #[DEBUG-START] 视频跳转耗时诊断，release时删掉
             if seek_perf:
                 session['debugSeekPerformance'] = seek_perf
             #[DEBUG-END]
-            self.ensure_video_keyframe_index(cache_key, ffmpeg_path, video_path)
+            if not timestamp_repair:
+                self.ensure_video_keyframe_index(cache_key, ffmpeg_path, video_path)
             session['task'] = asyncio.create_task(self.stream_ffmpeg_output(
                 websocket, widget_id, stream_id, ffmpeg_path, video_path, start_time,
                 media_info.get('sourceAudioCodec'), media_info.get('audioTranscoded', False)
             ))
         except Exception as e:
+            if not is_current():
+                return
             #[DEBUG-START] 视频跳转耗时诊断，release时删掉
             if seek_perf:
                 seek_perf.step('准备跳转失败', error=str(e))
             #[DEBUG-END]
             await self.send_stream_json(
                 websocket, 'VIDEO_STREAM_ERROR', widgetId=widget_id,
-                streamId=stream_id, error=str(e)
+                streamId=stream_id, error=str(e),
+                videoPath=data.get('videoPath'), requestId=data.get('requestId')
             )
     
+        finally:
+            if timestamp_repair and not repair_handed_over:
+                await timestamp_repair.close()
+            if is_current():
+                self.video_preparations[websocket].pop(widget_id, None)
+                if not self.video_preparations[websocket]:
+                    self.video_preparations.pop(websocket, None)
+
     def init_database(self):
         """初始化数据库"""
         # 确保模块目录存在
@@ -3290,16 +3443,18 @@ class ClassifyShowerModule:
 
     async def when_disconnect(self, websocket):
         """当连接断开时调用"""
-        widget_ids = list(self.video_streams.get(websocket, {}).keys())
+        widget_ids = (set(self.video_streams.get(websocket, {})) | set(self.video_preparations.get(websocket, {}))
+                      | set(self.video_request_tasks.get(websocket, {})))
         for widget_id in widget_ids:
             await self.cancel_video_stream(websocket, widget_id)
         print("[分类展示模块] 连接断开")
 
     async def shutdown(self):
         """服务退出时回收全部 FFmpeg 流和数据库连接。"""
-        for websocket, sessions in list(self.video_streams.items()):
-            for widget_id in list(sessions.keys()):
-                await self.cancel_video_stream(websocket, widget_id)
+        connections = set(self.video_streams) | set(self.video_preparations) | set(self.video_request_tasks)
+        for websocket in connections:
+            await self.when_disconnect(websocket)
+        self.video_preparations.clear()
         metadata_tasks = list(self.video_keyframe_tasks.values()) + list(self.media_probe_tasks.values())
         for task in metadata_tasks:
             task.cancel()
@@ -3322,7 +3477,23 @@ class ClassifyShowerModule:
             #await self.send_classify_data(websocket)
 
         elif command in ('START_VIDEO_STREAM', 'SEEK_VIDEO_STREAM'):
-            await self.start_video_stream(websocket, data)
+            # 请求接收不能被全片解码阻塞，否则 CANCEL/切换剧集无法及时处理。
+            widget_id = data.get('widgetId', '')
+            previous = self.video_request_tasks.get(websocket, {}).get(widget_id)
+            if previous:
+                previous.cancel()
+                await asyncio.gather(previous, return_exceptions=True)
+            task = asyncio.create_task(self.start_video_stream(websocket, data))
+            self.video_request_tasks.setdefault(websocket, {})[widget_id] = task
+            def completed(done):
+                tasks = self.video_request_tasks.get(websocket, {})
+                if tasks.get(widget_id) is done:
+                    tasks.pop(widget_id, None)
+                if not tasks:
+                    self.video_request_tasks.pop(websocket, None)
+                if not done.cancelled():
+                    done.exception()
+            task.add_done_callback(completed)
 
         elif command == 'CANCEL_VIDEO_STREAM':
             await self.cancel_video_stream(websocket, data.get('widgetId', ''))
@@ -3384,6 +3555,12 @@ class ClassifyShowerModule:
             video_path = data.get('videoPath')
             print(f"[分类展示模块] 收到获取视频数据请求: rootPath={root_path}, videoPath={video_path}")
             
+            playback_policy = {'force-buffered-playback': False, 'buffered-playback-reason': None}
+            try:
+                resolved_video = self.resolve_video_path(root_path, video_path)
+                playback_policy = self.read_video_playback_policy(resolved_video)
+            except (OSError, ValueError, TypeError):
+                pass
             danmaku_data = []
             has_danmaku = False
             auto_seek_time = 0
@@ -3418,7 +3595,10 @@ class ClassifyShowerModule:
                 'widgetId': widget_id,
                 'has-danmaku': has_danmaku,
                 'danmaku-data': danmaku_data,
-                'auto-seek-time': auto_seek_time
+                'auto-seek-time': auto_seek_time,
+                'videoPath': video_path,
+                'requestId': data.get('requestId'),
+                **playback_policy
             }, ensure_ascii=False)
             await websocket.send(message)
 

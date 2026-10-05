@@ -89,6 +89,7 @@ frontend/nplayer/index.html
 关联项目/评论json转db/AI生成原始版本/test/
 关联项目/评论json转db/std/test/
 关联项目/评论json转db/v1/test/
+backend/tests/
 
 #发行版本
 build/release/

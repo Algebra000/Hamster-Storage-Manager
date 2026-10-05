@@ -10,6 +10,7 @@ start.bat
 
 backend\back.py
 backend\classify_shower_back.py
+backend\video_timestamp_repair.py
 backend\treemap_back.py
 backend\classify_shower\pinyin.txt
 backend\config\classify_shower_config.json

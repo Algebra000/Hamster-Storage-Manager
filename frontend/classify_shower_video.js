@@ -1716,9 +1716,20 @@ class CS_VideoPlayerWidget {
                 if (data.requestId !== this.videoDataRequestId
                     || data.videoPath !== this.currentEpisode?.path) return;
                 this.forceBufferedPlayback = data['force-buffered-playback'] === true;
+                this.playbackSource = this.currentEpisode.path;
+                this.h265PlaybackBlocked = false;
+                if (data['video-stream'] === 'H265' && !this.supportsH265()) {
+                    const compatFile = typeof data.compat_file === 'string' ? data.compat_file : '';
+                    if (compatFile) {
+                        this.playbackSource = compatFile;
+                        this.forceBufferedPlayback = false;
+                    } else {
+                        this.h265PlaybackBlocked = true;
+                    }
+                }
                 this.timestampNotice?.close();
                 this.timestampNotice = null;
-                if (this.forceBufferedPlayback && typeof window.frame_show_notice === 'function') {
+                if (this.forceBufferedPlayback && !this.h265PlaybackBlocked && typeof window.frame_show_notice === 'function') {
                     this.timestampNotice = window.frame_show_notice(
                         '该 MP4 的显示时间戳异常，将修复时间轴并采用缓冲播放。',
                         6000, '#FFE69A', true, '#5C4300');
@@ -3546,8 +3557,9 @@ class CS_VideoPlayerWidget {
     initPlayer(playerId) {
         if (!this.currentEpisode) return;
 
-        const nativePlayback = !this.forceBufferedPlayback && this.isNativeVideo(this.currentEpisode.path);
-        const videoPath = nativePlayback ? this.getVideoUrl(this.currentEpisode.path) : '';
+        const source = this.playbackSource || this.currentEpisode.path;
+        const nativePlayback = !this.forceBufferedPlayback && this.isNativeVideo(source);
+        const videoPath = nativePlayback ? this.getVideoUrl(source) : '';
         const hasDanmu = this.currentEpisode.hasDanmu;
 
         // 如果有弹幕，加载弹幕脚本
@@ -3578,7 +3590,7 @@ class CS_VideoPlayerWidget {
                 }]
             ]
         };
-        if (nativePlayback) {
+        if (nativePlayback && !this.h265PlaybackBlocked) {
             playerOptions.src = videoPath;
         }
 
@@ -3591,7 +3603,18 @@ class CS_VideoPlayerWidget {
         this.player = new NPlayer.Player(playerOptions);
         this.player.mount();
 
-        if (!nativePlayback) {
+        if (this.h265PlaybackBlocked) {
+            const video = this.player.video;
+            if (video) video.style.background = '#000';
+            container.style.background = '#000';
+            const message = '本设备不支持H265且无可用的兼容视频来源，因此无法播放该视频';
+            if (typeof window.frame_show_notice === 'function') {
+                window.frame_show_notice(message, 6000, '#D32F2F', true, '#FFFFFF');
+            } else {
+                this.showStreamErrorOverlay(message);
+                this.streamErrorNotice.style.background = '#D32F2F';
+            }
+        } else if (!nativePlayback) {
             this.setupRemuxStream(this.autoSeekTime || 0);
         }
 
@@ -3631,6 +3654,8 @@ class CS_VideoPlayerWidget {
         this.danmakuData = null;
         this.autoSeekTime = 0;
         this.forceBufferedPlayback = false;
+        this.playbackSource = null;
+        this.h265PlaybackBlocked = false;
         if (this.player && this.player.dispose) {
             this.player.dispose();
         }
@@ -3641,6 +3666,17 @@ class CS_VideoPlayerWidget {
         this.sendCommand('GET_CS_VIDEO_DATA', {
             rootPath: this.rootPath,
             videoPath: episode.path
+        });
+    }
+
+    supportsH265() {
+        const video = document.createElement('video');
+        return ['hvc1.1.6.L93.B0', 'hev1.1.6.L93.B0', 'hvc1', 'hev1'].some(codec => {
+            try {
+                return ['probably', 'maybe'].includes(video.canPlayType(`video/mp4; codecs="${codec}"`));
+            } catch (error) {
+                return false;
+            }
         });
     }
 
@@ -4258,9 +4294,24 @@ class CS_VideoPlayerWidget {
     }
 
     getVideoUrl(path) {
-        // 构建视频文件的URL
-        // 假设rootPath是服务器上的路径
-        return `${this.rootPath}/${encodeURIComponent(path)}`;
+        // 按路径段编码，保留兼容文件和子目录中的目录分隔符。
+        const encodePath = value => value.split('/').map(encodeURIComponent).join('/');
+        const root = String(this.rootPath || '').replace(/\\/g, '/').replace(/\/+$/, '');
+        const relativePath = String(path || '').replace(/\\/g, '/').replace(/^\/+/, '');
+        let base;
+        if (root.startsWith('//')) {
+            // Windows UNC 路径：\\server\share -> file://server/share。
+            base = `file:${encodePath(root)}`;
+        } else if (/^[A-Za-z]:\//.test(root)) {
+            base = `file:///${root.slice(0, 2)}${encodePath(root.slice(2))}`;
+        } else if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(root)) {
+            base = root;
+        } else if (root.startsWith('/')) {
+            base = `file://${encodePath(root)}`;
+        } else {
+            base = encodePath(root);
+        }
+        return `${base}/${encodePath(relativePath)}`;
     }
 
     saveCurrentTime() {

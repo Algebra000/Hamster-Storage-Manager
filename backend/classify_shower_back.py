@@ -1381,8 +1381,10 @@ class ClassifyShowerModule:
     def read_video_playback_policy(self, video_path):
         """仅明确的 JSON false 触发普通 MP4 修复；读取失败保持原播放策略。"""
         force = False
+        video_stream = ''
+        compat_file = ''
         status = 'not-mp4'
-        if Path(video_path).suffix.lower() == '.mp4':
+        if video_path:
             status = 'missing-or-unreadable'
             metadata_path = os.path.realpath(video_path + '@meta')
             meta_file = os.path.realpath(os.path.join(metadata_path, '__meta'))
@@ -1395,14 +1397,22 @@ class ClassifyShowerModule:
                         data = json.load(source)
                     if isinstance(data, dict):
                         value = data.get('mp4-timestamps-valid')
-                        force = value is False
+                        force = Path(video_path).suffix.lower() == '.mp4' and value is False
+                        stream_value = data.get('video-stream')
+                        video_stream = stream_value if isinstance(stream_value, str) else ''
                         status = 'false' if force else 'default'
                 except (OSError, ValueError):
                     pass
+            if video_stream == 'H265':
+                candidate = os.path.realpath(os.path.join(
+                    os.path.dirname(video_path), '__COMPAT__', os.path.basename(video_path)))
+                if self.is_path_within(os.path.dirname(video_path), candidate) and os.path.isfile(candidate):
+                    compat_file = candidate
         #[DEBUG-START]
         print(f'[视频播放策略] 元数据状态={status} 修复缓冲播放={force} 文件={video_path}')
         #[DEBUG-END]
         return {'force-buffered-playback': force,
+                'video-stream': video_stream, 'compat_file': compat_file,
                 'buffered-playback-reason': 'mp4-timestamps-invalid' if force else None}
 
     VIDEO_METADATA_CACHE_LIMIT = 32
@@ -3646,10 +3656,14 @@ class ClassifyShowerModule:
             video_path = data.get('videoPath')
             print(f"[分类展示模块] 收到获取视频数据请求: rootPath={root_path}, videoPath={video_path}")
             
-            playback_policy = {'force-buffered-playback': False, 'buffered-playback-reason': None}
+            playback_policy = {'force-buffered-playback': False, 'buffered-playback-reason': None,
+                               'video-stream': '', 'compat_file': ''}
             try:
                 resolved_video = self.resolve_video_path(root_path, video_path)
                 playback_policy = self.read_video_playback_policy(resolved_video)
+                if playback_policy['compat_file']:
+                    playback_policy['compat_file'] = os.path.relpath(
+                        playback_policy['compat_file'], os.path.realpath(root_path)).replace(os.sep, '/')
             except (OSError, ValueError, TypeError):
                 pass
             danmaku_data = []

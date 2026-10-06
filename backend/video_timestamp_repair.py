@@ -6,6 +6,10 @@ import os
 import re
 import struct
 import subprocess
+from types import MappingProxyType
+#[DEBUG-START]
+import time
+#[DEBUG-END]
 
 
 MAX_MOOV_BYTES = 64 * 1024 * 1024
@@ -181,8 +185,8 @@ def sample_tables(moov):
     return track, positions, durations, dts, offsets
 
 
-class MP4StreamTimestampRepair:
-    """解码器有界地提供显示顺序，流复制分片在发送前补写 trun 显示偏移。"""
+class MP4TimestampMetadata:
+    """可复用的原文件样本表；不包含队列、进程或播放游标。"""
     def __init__(self, source):
         self.source = source
         moov = read_moov(source)[2]
@@ -202,6 +206,19 @@ class MP4StreamTimestampRepair:
         if not self.keys or any(n < 0 or n >= len(self.positions) for n in self.keys):
             raise ValueError('MP4 关键帧样本索引无效')
         self.vfr = max(self.durations) - min(self.durations) > 1
+        for name in ('positions', 'durations', 'dts', 'cts', 'sizes', 'keys'):
+            setattr(self, name, tuple(getattr(self, name)))
+        self.position_index = MappingProxyType(self.position_index)
+
+
+class MP4StreamTimestampRepair:
+    """解码器有界地提供显示顺序，流复制分片在发送前补写 trun 显示偏移。"""
+    def __init__(self, source, metadata=None):
+        self.source = source
+        metadata = metadata if metadata is not None else MP4TimestampMetadata(source)
+        for name in ('positions', 'durations', 'dts', 'cts', 'position_index',
+                     'timescale', 'sizes', 'keys', 'vfr'):
+            setattr(self, name, getattr(metadata, name))
         # 构造函数在线程池中读取元数据；Python 3.8 的 Queue 必须在事件循环线程创建。
         self.queue = None
         self.pending = {}
@@ -304,7 +321,15 @@ class MP4StreamTimestampRepair:
                 raise ValueError('视频重排范围超出流式修复上限')
         return self.pending.pop(index)
 
-    async def repair_segment(self, payload):
+    async def repair_segment(self, payload,
+                             #[DEBUG-START]
+                             debug_stats=None,
+                             #[DEBUG-END]
+                             ):
+        #[DEBUG-START]
+        display_wait_seconds = 0.0
+        sample_count = 0
+        #[DEBUG-END]
         moof = child(payload, b'moof')
         replacements = {}
         for traf_offset, kind, traf in boxes(moof):
@@ -358,7 +383,14 @@ class MP4StreamTimestampRepair:
                         if payload[data_offset:data_offset + size] != original:
                             raise ValueError('流复制与解码器未从同一个视频样本开始')
                         self.started = True
+                    #[DEBUG-START]
+                    display_wait_start = time.perf_counter()
+                    #[DEBUG-END]
                     number = await self.display_number(self.cursor)
+                    #[DEBUG-START]
+                    display_wait_seconds += time.perf_counter() - display_wait_start
+                    sample_count += 1
+                    #[DEBUG-END]
                     if self.vfr:
                         source_pts = self.dts[self.cursor] + self.cts[self.cursor]
                     else:
@@ -377,6 +409,11 @@ class MP4StreamTimestampRepair:
                 if p != len(run):
                     raise ValueError('fMP4 trun 样本表长度无效')
                 replacements[(traf_offset, run_offset)] = bytes(result)
+        #[DEBUG-START]
+        if debug_stats is not None:
+            debug_stats.update(displayOrderWaitMs=display_wait_seconds * 1000,
+                               videoSamples=sample_count)
+        #[DEBUG-END]
         if not replacements:
             return payload
         def rewrite(delta):

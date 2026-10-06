@@ -1682,6 +1682,10 @@ class CS_VideoPlayerWidget {
         this.streamStartTime = 0; // 当前视频流在整部视频时间轴上的起始秒数。
         this.streamDuration = 0; // 当前视频文件的总时长（秒）。
         this.streamSeekTimer = null; // 对进度条拖动请求进行防抖的定时器。
+        this.streamSeekPending = false; // 防抖期间暂停向旧流追加缓冲请求。
+        this.streamIsSeek = false;
+        this.streamPlaybackMode = 'remux';
+        this.streamRepairSeekPrebufferSeconds = 1;
         this.streamSeekingHandler = null; // video 元素 seeking 事件的处理函数。
         this.streamPlayHandler = null; // video 元素 play 事件的处理函数。
         this.streamTimeUpdateHandler = null; // video 元素 timeupdate 事件的处理函数。
@@ -1788,10 +1792,16 @@ class CS_VideoPlayerWidget {
                 }
                 //[DEBUG-END]
                 this.streamQueue.push({
+                    //[DEBUG-START]
+                    receivedAt: performance.now(),
+                    //[DEBUG-END]
                     payload: payload,
                     sequence: header.sequence,
                     segmentType: header.segmentType || 'unknown'
                 });
+                //[DEBUG-START]
+                this.recordStreamChunkPerformance('分段接收', this.streamQueue[this.streamQueue.length - 1]);
+                //[DEBUG-END]
                 this.appendNextStreamChunk();
             }
         };
@@ -3664,8 +3674,23 @@ class CS_VideoPlayerWidget {
         };
 
         this.streamSeekingHandler = () => {
-            if (this.restartingStream || this.streamFailed
-                || this.isTimeBuffered(video.currentTime)) return;
+            if (this.restartingStream || this.streamFailed) return;
+            //[DEBUG-START]
+            const wasSeekPending = this.streamSeekPending;
+            //[DEBUG-END]
+            clearTimeout(this.streamSeekTimer);
+            this.streamSeekTimer = null;
+            this.streamSeekPending = false;
+            if (this.isTimeBuffered(video.currentTime)) {
+                //[DEBUG-START]
+                if (wasSeekPending) {
+                    this.clearStreamSeekFrameCallback();
+                    this.streamSeekPerformance = null;
+                }
+                //[DEBUG-END]
+                return;
+            }
+            this.streamSeekPending = true;
             const seekTime = Math.max(0, Number(video.currentTime) || 0);
             //[DEBUG-START] 视频跳转耗时诊断，release时删掉
             const debugStarted = performance.now();
@@ -3716,6 +3741,11 @@ class CS_VideoPlayerWidget {
 
         this.clearUnsupportedVideoNotice();
         this.resumeAfterStreamOpen = !video.paused;
+        clearTimeout(this.streamSeekTimer);
+        this.streamSeekTimer = null;
+        this.streamSeekPending = false;
+        this.streamIsSeek = command === 'SEEK_VIDEO_STREAM';
+        this.streamPlaybackMode = 'remux';
         this.restartingStream = true;
         this.streamStartTime = Math.max(0, Number(startTime) || 0);
         this.activeStreamId = null;
@@ -3776,6 +3806,7 @@ class CS_VideoPlayerWidget {
         }
 
         this.activeStreamId = data.streamId;
+        this.streamPlaybackMode = data.playbackMode || 'remux';
         this.clearStreamErrorOverlay();
         //[DEBUG-START] 视频跳转耗时诊断，release时删掉
         if (this.streamSeekPerformance) {
@@ -3813,7 +3844,18 @@ class CS_VideoPlayerWidget {
             this.sourceBuffer = this.mediaSource.addSourceBuffer(data.mimeType);
             this.sourceBuffer.mode = 'segments';
             this.sourceBuffer.timestampOffset = this.streamStartTime;
+            const sourceBuffer = this.sourceBuffer;
             this.sourceBuffer.addEventListener('updateend', () => {
+                if (this.sourceBuffer !== sourceBuffer) return;
+                //[DEBUG-START]
+                if (this.currentStreamSegment) {
+                    this.recordStreamChunkPerformance('分段追加完成', this.currentStreamSegment, {
+                        appendMs: performance.now() - this.currentStreamSegment.appendedAt,
+                        bufferedAhead: this.getBufferedAhead(this.streamStartTime)
+                    });
+                }
+                //[DEBUG-END]
+                this.currentStreamSegment = null;
                 this.setInitialStreamPositionIfReady();
                 if (this.trimOldStreamBuffer()) {
                     this.requestMoreStreamData();
@@ -3840,6 +3882,9 @@ class CS_VideoPlayerWidget {
     }
 
     handleUnsupportedVideoStream(data) {
+        clearTimeout(this.streamSeekTimer);
+        this.streamSeekTimer = null;
+        this.streamSeekPending = false;
         const message = data.message || '不支持该视频的视频编码格式';
         this.streamFailed = true;
         this.streamQueue = [];
@@ -3889,6 +3934,12 @@ class CS_VideoPlayerWidget {
         if (!this.sourceBuffer || this.sourceBuffer.updating || this.streamQueue.length === 0) return;
         try {
             this.currentStreamSegment = this.streamQueue.shift();
+            //[DEBUG-START]
+            this.currentStreamSegment.appendedAt = performance.now();
+            this.recordStreamChunkPerformance('开始追加分段', this.currentStreamSegment, {
+                queueWaitMs: this.currentStreamSegment.appendedAt - this.currentStreamSegment.receivedAt
+            });
+            //[DEBUG-END]
             this.sourceBuffer.appendBuffer(this.currentStreamSegment.payload);
         } catch (error) {
             this.failRemuxStream(`写入视频缓冲区失败：${error.message}`);
@@ -3942,6 +3993,17 @@ class CS_VideoPlayerWidget {
     }
 
     //[DEBUG-START] 视频跳转耗时诊断，release时删掉
+    recordStreamChunkPerformance(label, segment, details = {}) {
+        const trace = this.streamSeekPerformance;
+        if (!trace || trace.streamId !== this.activeStreamId || !this.restartingStream || !segment) return;
+        console.log(`[视频分段耗时][${trace.requestId}] ${label}`, {
+            streamId: this.activeStreamId, sequence: segment.sequence,
+            segmentType: segment.segmentType, bytes: segment.payload.byteLength,
+            queueLength: this.streamQueue.length,
+            elapsedMs: performance.now() - trace.started, ...details
+        });
+    }
+
     clearStreamSeekFrameCallback() {
         const callback = this.streamSeekFrameCallback;
         if (callback && typeof callback.video.cancelVideoFrameCallback === 'function') {
@@ -3962,9 +4024,11 @@ class CS_VideoPlayerWidget {
     //[DEBUG-END]
 
     getStreamPrebufferTarget() {
-        if (this.streamDuration <= 0) return this.streamPrebufferSeconds;
+        const target = this.streamIsSeek && this.streamPlaybackMode === 'timestamp-repair'
+            ? this.streamRepairSeekPrebufferSeconds : this.streamPrebufferSeconds;
+        if (this.streamDuration <= 0) return target;
         const remaining = Math.max(0.1, this.streamDuration - this.streamStartTime);
-        return Math.min(this.streamPrebufferSeconds, remaining);
+        return Math.min(target, remaining);
     }
 
     getBufferedAhead(time) {
@@ -3984,6 +4048,7 @@ class CS_VideoPlayerWidget {
     }
 
     requestMoreStreamData(force = false) {
+        if (this.streamSeekPending) return;
         const video = this.player && this.player.video;
         if (!video || !this.activeStreamId || this.streamEnded || this.streamFailed) return;
         const playbackTime = this.restartingStream
@@ -4080,6 +4145,10 @@ class CS_VideoPlayerWidget {
         //[DEBUG-END]
         clearTimeout(this.streamSeekTimer);
         const video = this.player && this.player.video;
+        this.streamSeekTimer = null;
+        this.streamSeekPending = false;
+        this.streamIsSeek = false;
+        this.streamPlaybackMode = 'remux';
         if (video && this.streamSeekingHandler) {
             video.removeEventListener('seeking', this.streamSeekingHandler);
         }
@@ -4110,6 +4179,9 @@ class CS_VideoPlayerWidget {
 
     failRemuxStream(message) {
         if (this.streamFailed) return;
+        clearTimeout(this.streamSeekTimer);
+        this.streamSeekTimer = null;
+        this.streamSeekPending = false;
         //[DEBUG-START] 视频跳转耗时诊断，release时删掉
         this.clearStreamSeekFrameCallback();
         this.recordStreamSeekPerformance('跳转失败', { error: message });

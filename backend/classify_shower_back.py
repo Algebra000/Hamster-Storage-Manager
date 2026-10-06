@@ -24,7 +24,7 @@ from urllib.request import Request, urlopen
 
 # 导入文件类型列表
 from config.file_type import video_type_list
-from video_timestamp_repair import MP4StreamTimestampRepair, run_in_thread
+from video_timestamp_repair import MP4StreamTimestampRepair, MP4TimestampMetadata, run_in_thread
 
 
 COMMENT_DATABASE_SCHEMA_VERSION = "v1.1"
@@ -1199,6 +1199,7 @@ class ClassifyShowerModule:
         self.video_preparations = {}
         self.video_request_tasks = {}
         self.media_probe_cache = OrderedDict()
+        self.video_repair_metadata_cache = OrderedDict()
         self.media_probe_tasks = {}
         self.video_keyframe_cache = OrderedDict()
         self.video_keyframe_tasks = {}
@@ -1405,6 +1406,20 @@ class ClassifyShowerModule:
                 'buffered-playback-reason': 'mp4-timestamps-invalid' if force else None}
 
     VIDEO_METADATA_CACHE_LIMIT = 32
+
+    async def cached_repair_metadata(self, cache_key, ffmpeg_path, video_path):
+        cache = self.video_repair_metadata_cache
+        if cache_key in cache:
+            cache.move_to_end(cache_key)
+            return cache[cache_key]
+        metadata = await run_in_thread(MP4TimestampMetadata, video_path)
+        if self.video_metadata_key(ffmpeg_path, video_path) != cache_key:
+            raise ValueError('读取修复元数据期间视频或 FFmpeg 已变化，请重新播放')
+        self.store_video_metadata(cache, cache_key, metadata)
+        # 样本表比媒体探测结果大，最多缓存4部视频、合计50万个样本。
+        while len(cache) > 4 or sum(len(item.positions) for item in cache.values()) > 500000:
+            cache.popitem(last=False)
+        return metadata
 
     @staticmethod
     def video_metadata_key(ffmpeg_path, video_path):
@@ -1914,8 +1929,9 @@ class ClassifyShowerModule:
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
-            else:
-                await self.stop_ffmpeg_process(process)
+            if process:
+                # 预启动的输出进程可能尚未交给输出任务执行。
+                await self.stop_ffmpeg_process(process, drain_stderr=True)
             # 输出任务可能尚未开始执行，不能只依赖它的 finally 回收辅助进程。
             if timestamp_repair:
                 await timestamp_repair.close(cleanup_trace)
@@ -1943,6 +1959,49 @@ class ClassifyShowerModule:
             session['bufferUntil'] = buffer_until
             session['flowEvent'].set()
 
+    async def create_video_output_process(self, ffmpeg_path, video_path, start_time,
+                                          source_audio_codec=None, transcode_audio=False,
+                                          timestamp_repair=False, fragment_duration=2000000):
+        """启动流复制进程；修复路径可在确认实际起点期间并行准备管道输出。"""
+        command = [ffmpeg_path, '-hide_banner', '-loglevel', 'warning']
+        if timestamp_repair:
+            command.extend(['-ignore_editlist', '1', '-noaccurate_seek'])
+        if start_time > 0:
+            command.extend(['-ss', f'{start_time:.9f}'])
+        command.extend([
+            '-i', video_path,
+            '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn',
+            '-c:v', 'copy'
+        ])
+        if timestamp_repair:
+            command.extend(['-copypriorss', '1'])
+        if transcode_audio:
+            # 音频转码远轻于视频转码；不加 -re，让 FFmpeg 按缓冲水位尽快产出 AAC。
+            # 统一采样到 48 kHz AAC-LC，避免 AMR 这类低采样率输入触发 AAC 码率上限。
+            command.extend([
+                '-c:a', 'aac', '-profile:a', 'aac_low',
+                '-ar:a', '48000', '-b:a', '128k'
+            ])
+        elif source_audio_codec:
+            command.extend(['-c:a', 'copy'])
+        if source_audio_codec == 'aac' and not transcode_audio:
+            # MPEG-TS 中的 AAC 通常采用 ADTS，比特流必须转换后才能写入 MP4。
+            command.extend(['-bsf:a', 'aac_adtstoasc'])
+        command.extend([
+            '-avoid_negative_ts', 'make_zero',
+            # 等首个媒体包经过 bitstream filter 后再写 moov，否则 TS/ADTS AAC
+            # 的 esds 会缺少 AudioSpecificConfig，Chromium 将拒绝初始化段。
+            '-movflags', 'frag_keyframe+empty_moov+default_base_moof+delay_moov',
+            '-frag_duration', str(fragment_duration), '-f', 'mp4', 'pipe:1'
+        ])
+        return await asyncio.create_subprocess_exec(
+            *command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        )
+
     async def stream_ffmpeg_output(self, websocket, widget_id: str, stream_id: str,
                                    ffmpeg_path: str, video_path: str, start_time: float,
                                    source_audio_codec: Optional[str] = None,
@@ -1960,49 +2019,14 @@ class ClassifyShowerModule:
             seek_perf.step('输出任务开始执行')
         #[DEBUG-END]
         try:
-            command = [ffmpeg_path, '-hide_banner', '-loglevel', 'warning']
-            if timestamp_repair:
-                command.extend(['-ignore_editlist', '1', '-noaccurate_seek'])
-            if start_time > 0:
-                seek_time = timestamp_repair.seek_time if timestamp_repair else start_time
-                command.extend(['-ss', f'{seek_time:.9f}'])
-            command.extend([
-                '-i', video_path,
-                '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn',
-                '-c:v', 'copy'
-            ])
-            if timestamp_repair:
-                command.extend(['-copypriorss', '1'])
-            if transcode_audio:
-                # 音频转码远轻于视频转码；不加 -re，让 FFmpeg 按缓冲水位尽快产出 AAC。
-                # 统一采样到 48 kHz AAC-LC，避免 AMR 这类低采样率输入触发 AAC 码率上限。
-                command.extend([
-                    '-c:a', 'aac', '-profile:a', 'aac_low',
-                    '-ar:a', '48000', '-b:a', '128k'
-                ])
-            elif source_audio_codec:
-                command.extend(['-c:a', 'copy'])
-            if source_audio_codec == 'aac' and not transcode_audio:
-                # MPEG-TS 中的 AAC 通常采用 ADTS，比特流必须转换后才能写入 MP4。
-                command.extend(['-bsf:a', 'aac_adtstoasc'])
-            command.extend([
-                '-avoid_negative_ts', 'make_zero',
-                # 等首个媒体包经过 bitstream filter 后再写 moov，否则 TS/ADTS AAC
-                # 的 esds 会缺少 AudioSpecificConfig，Chromium 将拒绝初始化段。
-                '-movflags', 'frag_keyframe+empty_moov+default_base_moof+delay_moov',
-                '-frag_duration', '2000000', '-f', 'mp4', 'pipe:1'
-            ])
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-            )
+            process = session.get('process')
+            if process is None:
+                process = await self.create_video_output_process(
+                    ffmpeg_path, video_path, start_time, source_audio_codec, transcode_audio)
             session['process'] = process
             #[DEBUG-START] 视频跳转耗时诊断，release时删掉
             if seek_perf:
-                seek_perf.step('FFmpeg 进程创建完成', pid=process.pid)
+                seek_perf.step('FFmpeg 输出进程就绪', pid=process.pid, prestarted=bool(timestamp_repair))
             #[DEBUG-END]
 
             async def collect_stderr():
@@ -2033,6 +2057,14 @@ class ClassifyShowerModule:
                 payload = b''.join(pending_boxes)
                 if not payload:
                     return
+                #[DEBUG-START]
+                debug_segment = bool(seek_perf and sequence <= 16)
+                debug_stats = {}
+                debug_ready_at = time.perf_counter()
+                if debug_segment:
+                    print(f'[视频分段耗时][{seek_perf.request_id}] 分片就绪 '
+                          f'{dict(streamId=stream_id, sequence=sequence, segmentType=segment_type, bytes=len(payload), elapsedMs=(debug_ready_at-seek_perf.started)*1000)}')
+                #[DEBUG-END]
                 if segment_type == 'init':
                     if timestamp_repair:
                         timestamp_repair.init_segment(payload)
@@ -2054,12 +2086,33 @@ class ClassifyShowerModule:
                         if fragment_time_in_video <= session['bufferUntil'] + 0.05:
                             continue
                         await flow_event.wait()
+                    #[DEBUG-START]
+                    debug_repair_at = time.perf_counter()
+                    debug_stats['flowWaitMs'] = (debug_repair_at - debug_ready_at) * 1000
+                    #[DEBUG-END]
                     if timestamp_repair:
-                        payload = await timestamp_repair.repair_segment(payload)
+                        payload = await timestamp_repair.repair_segment(payload,
+                            #[DEBUG-START]
+                            debug_stats=debug_stats,
+                            #[DEBUG-END]
+                        )
+                    #[DEBUG-START]
+                    debug_stats['repairMs'] = (time.perf_counter() - debug_repair_at) * 1000
+                    if debug_segment:
+                        print(f'[视频分段耗时][{seek_perf.request_id}] 分片修复完成 '
+                              f'{dict(streamId=stream_id, sequence=sequence, **debug_stats)}')
+                    #[DEBUG-END]
+                #[DEBUG-START]
+                debug_send_at = time.perf_counter()
+                #[DEBUG-END]
                 await websocket.send(self.pack_video_chunk(
                     stream_id, widget_id, sequence, payload, segment_type
                 ))
                 #[DEBUG-START] 视频跳转耗时诊断，release时删掉
+                if debug_segment:
+                    debug_sent_at = time.perf_counter()
+                    print(f'[视频分段耗时][{seek_perf.request_id}] 分片发送完成 '
+                          f'{dict(streamId=stream_id, sequence=sequence, sendMs=(debug_sent_at-debug_send_at)*1000, elapsedMs=(debug_sent_at-seek_perf.started)*1000)}')
                 if seek_perf and segment_type == 'init' and debug_first_init:
                     debug_first_init = False
                     seek_perf.step('首个初始化段发送完成', bytes=len(payload))
@@ -2181,6 +2234,8 @@ class ClassifyShowerModule:
         stream_id = uuid.uuid4().hex
         preparation = {}
         timestamp_repair = None
+        output_start_task = None
+        prepared_process = None
         repair_handed_over = False
         self.video_preparations.setdefault(websocket, {})[widget_id] = preparation
         def is_current():
@@ -2202,17 +2257,33 @@ class ClassifyShowerModule:
                 seek_perf.step('路径与 FFmpeg 配置检查完成')
             #[DEBUG-END]
             policy = self.read_video_playback_policy(video_path)
+            #[DEBUG-START]
+            if seek_perf:
+                seek_perf.step('播放策略读取完成')
+            #[DEBUG-END]
+            cache_key = self.video_metadata_key(ffmpeg_path, video_path)
+            #[DEBUG-START]
+            if seek_perf:
+                seek_perf.step('媒体文件签名检查完成')
+            #[DEBUG-END]
             if policy['force-buffered-playback']:
-                timestamp_repair = await run_in_thread(MP4StreamTimestampRepair, video_path)
+                #[DEBUG-START]
+                repair_cache_hit = cache_key in self.video_repair_metadata_cache
+                #[DEBUG-END]
+                metadata = await self.cached_repair_metadata(cache_key, ffmpeg_path, video_path)
+                timestamp_repair = MP4StreamTimestampRepair(video_path, metadata)
+                #[DEBUG-START]
+                if seek_perf:
+                    seek_perf.step('修复样本表准备完成', cacheHit=repair_cache_hit)
+                #[DEBUG-END]
                 if not is_current():
                     return
             timestamp_result = 'streaming' if timestamp_repair else 'not-requested'
             preparation['mediaPath'] = video_path
-            cache_key = self.video_metadata_key(ffmpeg_path, video_path)
             #[DEBUG-START]
             probe_cache_hit = cache_key in self.media_probe_cache
             if seek_perf:
-                seek_perf.step('媒体缓存文件签名检查完成', cacheHit=probe_cache_hit)
+                seek_perf.step('媒体探测缓存查询完成', cacheHit=probe_cache_hit)
             #[DEBUG-END]
             media_info = await self.cached_probe_video(cache_key, ffmpeg_path, video_path)
             if not is_current():
@@ -2243,7 +2314,13 @@ class ClassifyShowerModule:
             if media_info['duration'] > 0:
                 start_time = min(start_time, max(0.0, media_info['duration'] - 0.1))
             if timestamp_repair:
+                output_start_task = asyncio.create_task(self.create_video_output_process(
+                    ffmpeg_path, video_path, start_time,
+                    media_info.get('sourceAudioCodec'), media_info.get('audioTranscoded', False),
+                    timestamp_repair=True,
+                    fragment_duration=1000000 if data.get('command') == 'SEEK_VIDEO_STREAM' else 2000000))
                 start_time = await timestamp_repair.start(ffmpeg_path, start_time)
+                prepared_process = await asyncio.shield(output_start_task)
                 #[DEBUG-START]
                 if seek_perf:
                     seek_perf.step('修复流关键帧定位完成', actualTime=start_time)
@@ -2296,7 +2373,7 @@ class ClassifyShowerModule:
                 'streamId': stream_id,
                 'mediaPath': video_path,
                 'timestampRepair': timestamp_repair,
-                'process': None,
+                'process': prepared_process,
                 'task': None,
                 'duration': media_info['duration'],
                 'bufferUntil': initial_buffer_until,
@@ -2329,7 +2406,20 @@ class ClassifyShowerModule:
     
         finally:
             if timestamp_repair and not repair_handed_over:
-                await timestamp_repair.close()
+                timestamp_repair.request_stop()
+                # 取消准备时仍完整取得并回收两个进程，重复取消不打断清理。
+                async def discard_preparation():
+                    try:
+                        if output_start_task is not None:
+                            try:
+                                process = await output_start_task
+                            except Exception:
+                                # 创建失败时没有进程句柄，保留原准备异常或取消结果。
+                                return
+                            await self.stop_ffmpeg_process(process, drain_stderr=True)
+                    finally:
+                        await timestamp_repair.close()
+                await asyncio.shield(discard_preparation())
             if is_current():
                 self.video_preparations[websocket].pop(widget_id, None)
                 if not self.video_preparations[websocket]:
@@ -3461,6 +3551,7 @@ class ClassifyShowerModule:
         await asyncio.gather(*metadata_tasks, return_exceptions=True)
         self.video_keyframe_cache.clear()
         self.media_probe_cache.clear()
+        self.video_repair_metadata_cache.clear()
         self.comment_page_connection_manager.close()
         db_conn = getattr(self, 'db_conn', None)
         if db_conn is not None:

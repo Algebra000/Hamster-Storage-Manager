@@ -1,6 +1,6 @@
 # settings() 函数
 
-该函数位于 `backend\classify_shower_back.py` 中，其往往在初次安装该模块时调用，用于初始化该模块的配置以使得模块能够正常运行。下面是该函数的实际功能。
+该函数实现在 `backend\classify_shower_video.py` 中，并由 `backend\classify_shower_back.py` 导出供安装向导调用，其往往在初次安装该模块时调用，用于初始化该模块的配置以使得模块能够正常运行。下面是该函数的实际功能。
 
 ---
 

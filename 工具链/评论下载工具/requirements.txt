@@ -2,3 +2,4 @@ httpx
 aiohttp
 colorama
 pycryptodomex
+certifi

@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import sqlite3
+import ssl
 import time
 import zipfile
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ import sys
 import aiohttp.client_exceptions
 import aiohttp.http_exceptions as aiohttp_http_exceptions
 import colorama
+import certifi
 from bilibili_api import Credential, Danmaku, comment, video
 from bilibili_api.utils.aid_bvid_transformer import bvid2aid
 from bilibili_api.utils.network import Api, ResponseCodeException, get_aiohttp_session
@@ -1234,6 +1236,9 @@ async def download_comment_resources(resource_urls: dict, base_path: Path,
                                      credential: Credential) -> None:
     """下载缺失资源；URL 已登记但本地缺失的文件也会补齐。"""
     base_path = Path(base_path)
+    # 保留系统信任证书，并补充 certifi 的 CA；整个资源下载过程复用一个上下文。
+    ssl_context = ssl.create_default_context()
+    ssl_context.load_verify_locations(cafile=certifi.where())
     for category in COMMENT_RESOURCE_TYPES:
         category_path = base_path / category
         category_path.mkdir(parents=True, exist_ok=True)
@@ -1257,7 +1262,7 @@ async def download_comment_resources(resource_urls: dict, base_path: Path,
                 try:
                     image_bytes = await Api(
                         url=url, method="GET", credential=credential
-                    ).request(byte=True)
+                    ).request(byte=True, ssl=ssl_context)
                     break
                 except (
                     aiohttp_http_exceptions.ContentLengthError,

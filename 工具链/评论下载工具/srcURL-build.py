@@ -145,8 +145,6 @@ def convert_ss_to_BV(ss_id: int, credential: Credential)->str:
         return ""
     else:
         content = resp.text
-        with open(f"ss{ss_id}.html","w",encoding="utf-8") as f:
-            f.write(content)
         objects = extract_json_from_scripts(content)
         bvid = ""
         for obj in objects:

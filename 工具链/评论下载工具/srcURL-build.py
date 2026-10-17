@@ -90,21 +90,21 @@ def extract_json_from_scripts(html: str) -> list:
 
     return result
 
+
+def try_get_bv_in_json(dic: dict)->str:
+    """
+    从JSON字典中提取BV号
+    """
+    try:
+        bvid_ = dic["data"]["result"]["arc"]["bvid"]
+    except KeyError:
+        bvid_ = ""
+    return bvid_
+
 def convert_ep_to_BV(ep_id: int, credential: Credential)->str:
     """
     将番剧ID转换为BV号
     """
-    def try_get_bv_in_json(dic: dict)->str:
-        """
-        从JSON字典中提取BV号
-        """
-        try:
-            bvid_ = dic["data"]["result"]["arc"]["bvid"]
-        except KeyError:
-            bvid_ = ""
-        return bvid_
-
-    
     url=f"https://www.bilibili.com/bangumi/play/ep{ep_id}"
     try:
         resp = httpx.get(
@@ -128,6 +128,34 @@ def convert_ep_to_BV(ep_id: int, credential: Credential)->str:
        
     return bvid
 
+def convert_ss_to_BV(ss_id: int, credential: Credential)->str:
+    """
+    将番剧ss号转换为BV号
+    """
+    url=f"https://www.bilibili.com/bangumi/play/ss{ss_id}"
+    try:
+        resp = httpx.get(
+            url,
+            cookies=credential.get_cookies(),
+            headers={"User-Agent": "Mozilla/5.0"},
+            follow_redirects=True,
+        )
+    except Exception as e:
+        print(f"获取番剧剧集ss{ss_id}详情失败: {e}")
+        return ""
+    else:
+        content = resp.text
+        with open(f"ss{ss_id}.html","w",encoding="utf-8") as f:
+            f.write(content)
+        objects = extract_json_from_scripts(content)
+        bvid = ""
+        for obj in objects:
+            if ("status" in obj) and ("data" in obj):
+                bvid = try_get_bv_in_json(obj)
+                if bvid:
+                    break
+       
+    return bvid
 
 def bili_video_url_parse(url: str)->dict:
     """
@@ -164,31 +192,55 @@ def bili_video_url_parse(url: str)->dict:
             return {}
     elif url.startswith("https://www.bilibili.com/bangumi/play/"):
         value_str = url[38:]
-        if not value_str.startswith("ep"):
-            print(f"URL{url}不是ep号番剧URL")
-            return {}
-        value_list = value_str.split("/?")
-        ep_id_str = ''
-        value_list_ = []
-        for i in range(len(value_list)):
-            value_list_ += value_list[i].split("?")
-        value_list = value_list_
-        if len(value_list) == 1 or len(value_list) == 2:
-            ep_id_str = value_list[0][2:]
+        if value_str.startswith("ss"):
+            value_list = value_str.split("/?")
+            ss_id_str = ''
+            value_list_ = []
+            for i in range(len(value_list)):
+                value_list_ += value_list[i].split("?")
+            value_list = value_list_
+            if len(value_list) == 1 or len(value_list) == 2:
+                ss_id_str = value_list[0][2:]
+            else:
+                print(f"URL{url}不合法")
+                return {}
+            ss_id = 0
+            if not is_num_str(ss_id_str):
+                print(f"URL{url}不合法的ss号格式")
+                return {}
+            else:
+                ss_id = int(ss_id_str)
+            bv = convert_ss_to_BV(ss_id, credential_)
+            if not bv:
+                print(f"URL{url}解析失败: 无法获取BV号")
+                return {}
+            out["bvid"] = bv
+        elif value_str.startswith("ep"):
+            value_list = value_str.split("/?")
+            ep_id_str = ''
+            value_list_ = []
+            for i in range(len(value_list)):
+                value_list_ += value_list[i].split("?")
+            value_list = value_list_
+            if len(value_list) == 1 or len(value_list) == 2:
+                ep_id_str = value_list[0][2:]
+            else:
+                print(f"URL{url}不合法")
+                return {}
+            ep_id = 0
+            if not is_num_str(ep_id_str):
+                print(f"URL{url}不合法的ep号格式")
+                return {}
+            else:
+                ep_id = int(ep_id_str)
+            bv = convert_ep_to_BV(ep_id, credential_)
+            if not bv:
+                print(f"URL{url}解析失败: 无法获取BV号")
+                return {}
+            out["bvid"] = bv
         else:
-            print(f"URL{url}不合法")
-            return {}
-        ep_id = 0
-        if not is_num_str(ep_id_str):
-            print(f"URL{url}不合法的ep号格式")
-            return {}
-        else:
-            ep_id = int(ep_id_str)
-        bv = convert_ep_to_BV(ep_id, credential_)
-        if not bv:
-            print(f"URL{url}解析失败: 无法获取BV号")
-            return {}
-        out["bvid"] = bv
+            print(f"URL{url}不是ep号也不是ss号番剧URL")
+            return {}    
     else:
         print(f"URL{url}不是B站视频URL")
         return {}

@@ -229,15 +229,56 @@
                 console.log(`连接 ${url}...`);
                 ws = new WebSocket(url);
                 ws.binaryType = 'arraybuffer';
+                const connection = ws;
+                let versionTimer = null;
+                let versionError = '';
+
+                function rejectVersion(reason) {
+                    versionError = reason;
+                    clearTimeout(versionTimer);
+                    console.error(reason);
+                    connection.close(3001, 'Backend version validation failed');
+                    statusElement.textContent = '🟥 未连接后端';
+                    statusElement.style.color = 'red';
+                }
                 
                 ws.onopen = () => {
+                    isConnected = false;
+                    statusElement.textContent = '🟨 正在验证';
+                    statusElement.style.color = 'orange';
+                    versionTimer = setTimeout(() => {
+                        rejectVersion('后端版本验证超时，需要 ROLAND 后端');
+                    }, 5000);
+                };
+
+                ws.onmessage = (event) => {
+                    if (versionError || connection !== ws) return;
+                    if (isConnected) {
+                        onMessage(event);
+                        return;
+                    }
+
+                    let data;
+                    try {
+                        data = JSON.parse(event.data);
+                    } catch (e) {
+                        rejectVersion('后端版本信息无效，需要 ROLAND 后端');
+                        return;
+                    }
+                    // 后端必须先发送版本信息，验证前不处理业务消息。
+                    if (!data || data.command !== 'BACKEND_VERSION' ||
+                        !Array.isArray(data.version) ||
+                        !data.version.some(version => typeof version === 'string' &&
+                            version.trim().split(/\s+/)[0] === VERSION_NAME)) {
+                        rejectVersion('后端版本不兼容，需要 ROLAND 后端');
+                        return;
+                    }
+                    clearTimeout(versionTimer);
                     isConnected = true;
                     console.log('连接成功');
                     basicEvent.when_connect();
                     reconnectAttempts = 0;
                 };
-                
-                ws.onmessage = onMessage;
                 
                 ws.onerror = (error) => {
                     console.error('连接错误:', error);
@@ -245,8 +286,12 @@
                 };
                 
                 ws.onclose = () => {
+                    clearTimeout(versionTimer);
                     console.log('连接断开');
                     basicEvent.when_disconnect();
+                    // if (versionError) {
+                    //     statusElement.textContent = '🟥 ' + versionError;
+                    // }
                     isConnected = false;
                     
                     // 自动重连
@@ -266,7 +311,7 @@
             }
             
             function send(data) {
-                if (ws && ws.readyState === WebSocket.OPEN) {
+                if (isConnected && ws && ws.readyState === WebSocket.OPEN) {
                     ws.send(data);
                     return true;
                 }

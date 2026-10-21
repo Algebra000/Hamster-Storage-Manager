@@ -106,6 +106,11 @@ module_manager = ModuleManager()
 async def handler(websocket, path=None):
     print("客户端已连接")
     try:
+        # 在路径和模块消息之前发送版本，供前端验证后端兼容性。
+        await websocket.send(json.dumps({
+            'command': 'BACKEND_VERSION',
+            'version': [BACK_VERSION]
+        }))
         pathstr = "; ".join(real_base_dirs)
         # 发送当前路径信息
         message = json.dumps({

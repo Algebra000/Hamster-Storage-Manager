@@ -90,6 +90,7 @@ frontend/nplayer/index.html
 关联项目/评论json转db/std/test/
 关联项目/评论json转db/v1/test/
 backend/tests/
+关联项目/稀饭动漫弹幕评论/tests/
 
 #发行版本
 build/release/

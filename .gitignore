@@ -76,6 +76,7 @@ frontend/背景图/
 # 第三方库
 关联项目/bilibiliAPI/bilibili_api/
 关联项目/bilibiliAPI/更改/文档/
+关联项目/libmedia/libmedia-1.3.1/
 
 #测试数据
 关联项目/bilibiliAPI/bilibili_comment_viewer/test/
@@ -91,6 +92,7 @@ frontend/nplayer/index.html
 关联项目/评论json转db/v1/test/
 backend/tests/
 关联项目/稀饭动漫弹幕评论/tests/
+关联项目/libmedia/tests/
 
 #发行版本
 build/release/

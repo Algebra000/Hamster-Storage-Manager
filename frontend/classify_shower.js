@@ -458,43 +458,7 @@ function cs_beautifyHorizontalScrollbar(div) {
     return cs_beautifyScrollbar(div, 'horizontal');
 }
 
-/**
- * 为 container 创建返回按钮和根按钮。
- * @param {HTMLElement} container - 要在其中添加按钮的容器元素。
- * @returns {HTMLElement} 创建的按钮容器。
- */
-function cs_createBackButtons(container) {
-    this.widgetId = 'anime_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
-    const menuBar = document.createElement('div');
-    menuBar.style.position = 'absolute';
-    menuBar.style.top = '10px';
-    menuBar.style.right = '20px';
-    menuBar.style.display = 'flex';
-    menuBar.style.gap = '10px';
-    menuBar.style.zIndex = '100';
-    menuBar.style.padding = '8px 12px';
-    menuBar.style.background = 'rgba(200, 220, 255, 0.9)';
-    menuBar.style.borderRadius = '20px';
-    menuBar.style.boxShadow = '0 2px 10px rgba(0,0,0,0.1)';
 
-    const createIconButton = (svgString, onClick, viewbox_str) => {
-        const btn = document.createElement('button');
-        btn.style.cssText = 'width:40px;height:40px;border:none;border-radius:50%;background:#4A90D9;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.2s;';
-        btn.innerHTML = `<svg viewBox="${viewbox_str}" width="30" height="30" fill="white">${svgString}</svg>`;
-        btn.onmouseover = () => { btn.style.background = '#357ABD'; btn.style.transform = 'scale(1.05)'; };
-        btn.onmouseout = () => { btn.style.background = '#4A90D9'; btn.style.transform = 'scale(1)'; };
-        btn.onclick = onClick;
-        return btn;
-    };
-
-    const backBtn = createIconButton(cs_return_svg_string, () => pop_page(1), cs_returnicon_viewbox);
-    const rootBtn = createIconButton(cs_home_svg_string, () => pop_page(256), cs_homeicon_viewbox);
-
-    menuBar.appendChild(backBtn);
-    menuBar.appendChild(rootBtn);
-    container.appendChild(menuBar);
-    return menuBar;
-}
 
 function cs_createPopupWindow(title = '', width = '500px') {
     const overlay = document.createElement('div');

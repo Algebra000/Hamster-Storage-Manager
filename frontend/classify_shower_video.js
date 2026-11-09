@@ -414,7 +414,7 @@ class CS_AnimeWidget {
 
     createBackButtons(container) {
         this.widgetId = 'anime_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
-        cs_createBackButtons(container);
+        createBackButtons(container);
     }
 
     async createSidebar(container) {
@@ -891,7 +891,7 @@ class CS_AnimeDetailWidget {
             });
         }
 
-        cs_createBackButtons(container);
+        createBackButtons(container);
 
         const contentDiv = document.createElement('div');
         contentDiv.style.cssText = 'position:absolute;top:10px;bottom:10px;left:50%;transform:translateX(-50%);width:70%;background:rgba(255,255,255,0.6);border-radius:10px;overflow-y:auto;display:flex;gap:30px;padding:20px;';
@@ -1828,7 +1828,7 @@ class CS_VideoPlayerWidget {
         this.loadNPlayerScripts();
 
         // 创建返回按钮栏
-        const backButtonBar = cs_createBackButtons(container);
+        const backButtonBar = createBackButtons(container);
 
         // 创建可滚动的内容容器
         const scrollContainer = document.createElement('div');
@@ -1964,7 +1964,7 @@ class CS_VideoPlayerWidget {
 
     /**
      * 创建评论入口。收起时它位于返回按钮栏左侧，展开后会移动到播放器右侧。
-     * @param {HTMLElement} backButtonBar - cs_createBackButtons() 返回的按钮栏。
+     * @param {HTMLElement} backButtonBar - createBackButtons() 返回的按钮栏。
      */
     createCommentPanel(backButtonBar) {
         if (!backButtonBar || !this.playerLayout || !this.playerContainer) return;
@@ -2026,7 +2026,7 @@ class CS_VideoPlayerWidget {
             this.setCommentExpanded(false);
         });
 
-        backButtonBar.appendChild(commentPanel);
+        insertMenuButton(backButtonBar, 0, commentPanel);
         this.commentPanel = commentPanel;
         this.commentIcon = commentIcon;
         this.commentCollapseButton = collapseButton;
@@ -3203,6 +3203,9 @@ class CS_VideoPlayerWidget {
             this.playerContainer.style.margin = '0';
             this.playerContainer.style.alignSelf = 'center';
             this.playerLayout.style.gap = '16px';
+            const menuIndex = getMenuButtonIndex(this.commentBackButtonBar, panel);
+            if (menuIndex >= 0) removeMenuButton(this.commentBackButtonBar, menuIndex);
+
             this.playerLayout.appendChild(panel);
             panel.title = '';
             panel.setAttribute('aria-label', '评论面板');
@@ -3232,7 +3235,7 @@ class CS_VideoPlayerWidget {
             this.playerContainer.style.margin = '0 auto';
             this.playerContainer.style.alignSelf = 'flex-start';
             this.playerLayout.style.gap = '0';
-            this.commentBackButtonBar.appendChild(panel);
+            insertMenuButton(this.commentBackButtonBar, 0, panel);
             panel.title = '显示评论';
             panel.setAttribute('aria-label', '显示评论');
             Object.assign(panel.style, {

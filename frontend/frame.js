@@ -618,3 +618,96 @@ if (typeof when_disconnect_func_list !== 'undefined'){
         }
     );
 }
+
+
+// 默认布局的菜单栏标准接口；列表与动画状态由布局模块维护。
+const frameMenuButtons = new WeakMap();
+const frameMenuAnimations = new WeakMap();
+function layoutMenuButtons(menuBar) {
+    const buttons = frameMenuButtons.get(menuBar);
+    const old = buttons.map(button => button.getBoundingClientRect().left);
+    buttons.forEach((button, index) => {
+        frameMenuAnimations.get(button)?.cancel();
+        Object.assign(button.style, {position: 'absolute', top: '8px',
+            right: `calc(100% + ${10 + index * 50}px)`, width: '40px', height: '40px'});
+    });
+    buttons.forEach((button, index) => {
+        const dx = old[index] - button.getBoundingClientRect().left;
+        if (dx && button.animate) {
+            const animation = button.animate([{translate: `${dx}px 0`}, {translate: '0 0'}],
+                {duration: 240, easing: 'ease-out'});
+            frameMenuAnimations.set(button, animation);
+        }
+    });
+}
+function insertMenuButton(menuBar, index, button) {
+    const buttons = frameMenuButtons.get(menuBar);
+    if (!buttons) throw new TypeError('菜单栏必须由 createBackButtons 创建');
+    if (!Number.isInteger(index) || index < 0 || index > buttons.length) throw new RangeError('按钮索引越界');
+    if (!(button instanceof HTMLElement) || buttons.includes(button)) throw new TypeError('按钮必须是未注册的 HTML 元素');
+    if (button.parentElement && frameMenuButtons.get(button.parentElement)?.includes(button)) {
+        throw new TypeError('按钮已经属于其他菜单栏');
+    }
+    menuBar.appendChild(button);
+    Object.assign(button.style, {position:'absolute', top:'8px',
+        right:`calc(100% + ${10 + index * 50}px)`, width:'40px', height:'40px'});
+    buttons.splice(index, 0, button);
+    layoutMenuButtons(menuBar);
+    return button;
+}
+function appendMenuButton(menuBar, button) {
+    const buttons = frameMenuButtons.get(menuBar);
+    if (!buttons) throw new TypeError('菜单栏必须由 createBackButtons 创建');
+    return insertMenuButton(menuBar, buttons.length, button);
+}
+function getMenuButtonIndex(menuBar, button) {
+    return frameMenuButtons.get(menuBar)?.indexOf(button) ?? -1;
+}
+function removeMenuButton(menuBar, index) {
+    const buttons = frameMenuButtons.get(menuBar);
+    if (!buttons) throw new TypeError('菜单栏必须由 createBackButtons 创建');
+    if (!Number.isInteger(index) || index < 0 || index >= buttons.length) throw new RangeError('按钮索引越界');
+    const [button] = buttons.splice(index, 1);
+    frameMenuAnimations.get(button)?.cancel();
+    button.remove();
+    layoutMenuButtons(menuBar);
+    return button;
+}
+
+/**
+ * 为 container 创建返回按钮和根按钮。
+ * @param {HTMLElement} container - 要在其中添加按钮的容器元素。
+ * @returns {HTMLElement} 创建的按钮容器。
+ */
+function createBackButtons(container) {
+    const menuBar = document.createElement('div');
+    menuBar.style.position = 'absolute';
+    menuBar.style.top = '10px';
+    menuBar.style.right = '20px';
+    menuBar.style.display = 'flex';
+    menuBar.style.gap = '10px';
+    menuBar.style.zIndex = '100';
+    menuBar.style.padding = '8px 12px';
+    menuBar.style.background = 'rgba(200, 220, 255, 0.9)';
+    menuBar.style.borderRadius = '20px';
+    menuBar.style.boxShadow = '0 2px 10px rgba(0,0,0,0.1)';
+
+    const createIconButton = (svgString, onClick, viewbox_str) => {
+        const btn = document.createElement('button');
+        btn.style.cssText = 'width:40px;height:40px;border:none;border-radius:50%;background:#4A90D9;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.2s;';
+        btn.innerHTML = `<svg viewBox="${viewbox_str}" width="30" height="30" fill="white">${svgString}</svg>`;
+        btn.onmouseover = () => { btn.style.background = '#357ABD'; btn.style.transform = 'scale(1.05)'; };
+        btn.onmouseout = () => { btn.style.background = '#4A90D9'; btn.style.transform = 'scale(1)'; };
+        btn.onclick = onClick;
+        return btn;
+    };
+
+    const backBtn = createIconButton(`<path d="M15.036 9.577a1.03 1.03 0 0 1-1.03 1.03H4.479l2.76 2.759a1.03 1.03 0 0 1-1.456 1.455l-4.516-4.516a1.029 1.029 0 0 1 0-1.455l4.516-4.516a1.03 1.03 0 1 1 1.455 1.455l-2.76 2.76h9.53a1.03 1.03 0 0 1 1.029 1.028z"/>`, () => pop_page(1), '-1.5 0 19 19');
+    const rootBtn = createIconButton(`<path d="M14.993 7.61a.554.554 0 0 1-.756.207L7.98 4.255 1.764 7.817a.554.554 0 0 1-.55-.962l1.192-.683v-2.48a.476.476 0 0 1 .475-.474h1.222a.476.476 0 0 1 .475.475v1.234l3.126-1.79a.554.554 0 0 1 .55-.001l6.531 3.718a.554.554 0 0 1 .208.756zm-1.399.937v6.198a.476.476 0 0 1-.475.475H2.881a.476.476 0 0 1-.475-.475v-6.2L7.98 5.353zm-6.782 1.01H4.578v2.262h2.234zm4.61 0H9.188v2.262h2.234z"/>`, () => pop_page(256), '-1.5 0 19 19');
+
+    menuBar.appendChild(backBtn);
+    menuBar.appendChild(rootBtn);
+    container.appendChild(menuBar);
+    frameMenuButtons.set(menuBar, []);
+    return menuBar;
+}

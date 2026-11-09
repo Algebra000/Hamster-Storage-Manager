@@ -3314,6 +3314,11 @@ class CS_VideoPlayerWidget {
                 this.playerLayout.style.maxHeight = '';
                 this.commentExpandedLayoutHeight = 0;
             }
+            // FLIP 的 transform 动画不会持续触发 ResizeObserver，结束后同步最终尺寸。
+            const player = this.player;
+            if (player?.el?.isConnected) {
+                player.emit(player.EVENT.UPDATE_SIZE);
+            }
         };
 
         if (!canAnimatePlayer) {

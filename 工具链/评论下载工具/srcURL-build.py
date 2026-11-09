@@ -178,12 +178,12 @@ def bili_video_url_parse(url: str)->dict:
             out["bvid"] = value_list[0]
             params_list = value_list[1].split("&")
             for param in params_list:
-                if param.startswith("p"):
-                    key_value = param.split("=")
+                key_value = param.split("=")
+                if key_value[0] == "p":
                     if len(key_value) == 2 and is_num_str(key_value[-1]):
                         out["p"] = int(key_value[1])
                     else:
-                        print(f"URL{url}不合法的p参数格式")
+                        print(f"不合法的p参数格式: {param}")
                         break
         else:
             print(f"URL{url}不合法")
